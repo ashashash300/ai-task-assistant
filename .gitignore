@@ -1,0 +1,19 @@
+# Python
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+.uv-python/
+
+# Environment variables
+.env
+
+# Local SQLite databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite3
