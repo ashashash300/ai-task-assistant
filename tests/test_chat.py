@@ -1,4 +1,5 @@
 import json
+import logging
 from collections.abc import Generator
 from datetime import datetime, time, timedelta
 from types import SimpleNamespace
@@ -7,7 +8,14 @@ from zoneinfo import ZoneInfo
 import pytest
 from fastapi.testclient import TestClient
 from httpx import Request, Response
-from openai import BadRequestError
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    PermissionDeniedError,
+    RateLimitError,
+)
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -16,8 +24,10 @@ from ai_task_assistant.db.base import Base
 from ai_task_assistant.db.session import get_db
 from ai_task_assistant.main import app
 from ai_task_assistant.services import ai_service
+from ai_task_assistant.core.config import settings
 from ai_task_assistant.core.datetime import current_taipei_time
 from ai_task_assistant.services import conversation_service
+from ai_task_assistant.services import openai_provider
 
 
 class MockResponses:
@@ -100,7 +110,8 @@ def final_response(text: str, response_id: str = "resp_final") -> object:
 
 def mock_llm(monkeypatch: pytest.MonkeyPatch, responses: list[object]) -> MockOpenAIClient:
     mock_client = MockOpenAIClient(responses)
-    monkeypatch.setattr(ai_service, "get_openai_client", lambda: mock_client)
+    monkeypatch.setattr(settings, "ai_provider", "openai")
+    monkeypatch.setattr(openai_provider, "get_openai_client", lambda: mock_client)
     return mock_client
 
 
@@ -388,6 +399,187 @@ def test_task_not_found_is_safe(client: TestClient, monkeypatch: pytest.MonkeyPa
     }
 
 
+def test_openai_delete_tool_requires_confirmation_before_deleting(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = client.post("/tasks", json={"title": "Delete me"}).json()
+    mock_llm(
+        monkeypatch,
+        [tool_call("delete_task", {"task_id": task["id"]}), final_response("請確認刪除。")],
+    )
+
+    requested = client.post(
+        "/chat", json={"conversation_id": "delete-openai", "message": "刪除這個任務"}
+    )
+
+    assert requested.status_code == 200
+    assert requested.json()["response"] == "請確認是否刪除「Delete me」？"
+    assert client.get(f"/tasks/{task['id']}").status_code == 200
+    pending = conversation_service.get_pending_deletion("delete-openai")
+    assert pending is not None
+    assert pending.task_id == task["id"]
+
+    confirmed = client.post(
+        "/chat", json={"conversation_id": "delete-openai", "message": "確認"}
+    )
+
+    assert confirmed.status_code == 200
+    assert confirmed.json()["response"] == "已刪除「Delete me」。"
+    assert client.get(f"/tasks/{task['id']}").status_code == 404
+    assert conversation_service.get_pending_deletion("delete-openai") is None
+
+
+def test_delete_confirmation_can_be_cancelled(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    task = client.post("/tasks", json={"title": "Keep me"}).json()
+    mock_llm(
+        monkeypatch,
+        [tool_call("delete_task", {"task_id": task["id"]}), final_response("請確認刪除。")],
+    )
+    client.post("/chat", json={"conversation_id": "delete-cancel", "message": "刪除任務"})
+
+    cancelled = client.post(
+        "/chat", json={"conversation_id": "delete-cancel", "message": "取消"}
+    )
+
+    assert cancelled.json()["response"] == "已取消刪除「Keep me」。"
+    assert client.get(f"/tasks/{task['id']}").status_code == 200
+    assert conversation_service.get_pending_deletion("delete-cancel") is None
+
+
+def test_confirmation_without_pending_deletion_cannot_delete_task(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = client.post("/tasks", json={"title": "Safe task"}).json()
+    mock_llm(monkeypatch, [final_response("沒有待確認的刪除。")])
+
+    response = client.post(
+        "/chat", json={"conversation_id": "no-pending", "message": "確認"}
+    )
+
+    assert response.status_code == 200
+    assert client.get(f"/tasks/{task['id']}").status_code == 200
+
+
+def test_pending_deletions_are_isolated_by_conversation_id(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = client.post("/tasks", json={"title": "Isolated task"}).json()
+    mock_llm(
+        monkeypatch,
+        [
+            tool_call("delete_task", {"task_id": task["id"]}),
+            final_response("請確認刪除。"),
+            final_response("沒有待確認的刪除。"),
+        ],
+    )
+    client.post("/chat", json={"conversation_id": "delete-a", "message": "刪除任務"})
+
+    wrong_conversation = client.post(
+        "/chat", json={"conversation_id": "delete-b", "message": "確認"}
+    )
+    assert wrong_conversation.status_code == 200
+    assert client.get(f"/tasks/{task['id']}").status_code == 200
+
+    right_conversation = client.post(
+        "/chat", json={"conversation_id": "delete-a", "message": "確認"}
+    )
+
+    assert client.get(f"/tasks/{task['id']}").status_code == 404
+    assert right_conversation.json()["response"] == "已刪除「Isolated task」。"
+
+
+def test_new_delete_request_replaces_earlier_pending_deletion(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_task = client.post("/tasks", json={"title": "First task"}).json()
+    second_task = client.post("/tasks", json={"title": "Second task"}).json()
+    mock_llm(
+        monkeypatch,
+        [
+            tool_call("delete_task", {"task_id": first_task["id"]}),
+            final_response("請確認刪除。"),
+            tool_call("delete_task", {"task_id": second_task["id"]}),
+            final_response("請確認刪除。"),
+        ],
+    )
+
+    client.post("/chat", json={"conversation_id": "replace-delete", "message": "刪除第一筆"})
+    requested = client.post(
+        "/chat", json={"conversation_id": "replace-delete", "message": "刪除第二筆"}
+    )
+    confirmed = client.post(
+        "/chat", json={"conversation_id": "replace-delete", "message": "確認"}
+    )
+
+    assert requested.json()["response"] == "請確認是否刪除「Second task」？"
+    assert confirmed.status_code == 200
+    assert client.get(f"/tasks/{first_task['id']}").status_code == 200
+    assert client.get(f"/tasks/{second_task['id']}").status_code == 404
+
+
+def test_expired_delete_confirmation_cannot_delete_task(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = client.post("/tasks", json={"title": "Expired request"}).json()
+    mock_llm(
+        monkeypatch,
+        [
+            tool_call("delete_task", {"task_id": task["id"]}),
+            final_response("請確認刪除。"),
+            final_response("沒有待確認的刪除。"),
+        ],
+    )
+    client.post("/chat", json={"conversation_id": "expired-delete", "message": "刪除任務"})
+    pending = conversation_service.get_pending_deletion("expired-delete")
+    assert pending is not None
+    pending.expires_at = current_taipei_time() - timedelta(seconds=1)
+
+    response = client.post(
+        "/chat", json={"conversation_id": "expired-delete", "message": "確認"}
+    )
+
+    assert response.status_code == 200
+    assert client.get(f"/tasks/{task['id']}").status_code == 200
+    assert conversation_service.get_pending_deletion("expired-delete") is None
+
+
+def test_delete_tool_handles_nonexistent_task_and_cannot_be_reused(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = client.post("/tasks", json={"title": "Delete once"}).json()
+    mock_client = mock_llm(
+        monkeypatch,
+        [
+            tool_call("delete_task", {"task_id": 999}),
+            final_response("找不到任務。"),
+            tool_call("delete_task", {"task_id": task["id"]}),
+            final_response("請確認刪除。"),
+            final_response("沒有待確認的刪除。"),
+        ],
+    )
+
+    missing = client.post(
+        "/chat", json={"conversation_id": "missing-delete", "message": "刪除 999"}
+    )
+    requested = client.post(
+        "/chat", json={"conversation_id": "delete-once", "message": "刪除任務"}
+    )
+    first_confirmation = client.post(
+        "/chat", json={"conversation_id": "delete-once", "message": "確認"}
+    )
+    second_confirmation = client.post(
+        "/chat", json={"conversation_id": "delete-once", "message": "確認"}
+    )
+
+    assert missing.status_code == 200
+    assert conversation_service.get_pending_deletion("missing-delete") is None
+    assert requested.json()["response"] == "請確認是否刪除「Delete once」？"
+    assert first_confirmation.status_code == 200
+    assert second_confirmation.status_code == 200
+    assert client.get(f"/tasks/{task['id']}").status_code == 404
+    assert len(mock_client.responses.calls) == 5
+
+
 def test_llm_api_failure_is_safe(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     mock_llm(monkeypatch, [RuntimeError("network failure")])
 
@@ -395,6 +587,116 @@ def test_llm_api_failure_is_safe(client: TestClient, monkeypatch: pytest.MonkeyP
 
     assert response.status_code == 503
     assert response.json() == {"detail": "AI service is temporarily unavailable"}
+
+
+def test_missing_gemini_key_returns_safe_error_without_openai_fallback(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_if_openai_is_called():
+        pytest.fail("OpenAI must not be called when Gemini is selected")
+
+    monkeypatch.setattr(settings, "ai_provider", "gemini")
+    monkeypatch.setattr(settings, "gemini_api_key", None)
+    monkeypatch.setattr(openai_provider, "get_openai_client", fail_if_openai_is_called)
+
+    response = client.post("/chat", json={"message": "建立任務"})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "AI service is not configured"}
+
+
+def openai_status_error(error_class: type[Exception], status_code: int) -> Exception:
+    request = Request("POST", "https://api.openai.com/v1/responses")
+    response = Response(
+        status_code,
+        request=request,
+        headers={"x-request-id": "req_diagnostic_123"},
+    )
+    return error_class("sensitive error content must not be logged", response=response, body=None)
+
+
+@pytest.mark.parametrize(
+    ("error", "exception_name", "status_code", "request_id"),
+    [
+        (openai_status_error(AuthenticationError, 401), "AuthenticationError", "401", "req_diagnostic_123"),
+        (openai_status_error(PermissionDeniedError, 403), "PermissionDeniedError", "403", "req_diagnostic_123"),
+        (openai_status_error(RateLimitError, 429), "RateLimitError", "429", "req_diagnostic_123"),
+        (openai_status_error(BadRequestError, 400), "BadRequestError", "400", "req_diagnostic_123"),
+        (
+            APIConnectionError(
+                message="sensitive connection error content must not be logged",
+                request=Request("POST", "https://api.openai.com/v1/responses"),
+            ),
+            "APIConnectionError",
+            "none",
+            "none",
+        ),
+        (
+            APITimeoutError(Request("POST", "https://api.openai.com/v1/responses")),
+            "APITimeoutError",
+            "none",
+            "none",
+        ),
+    ],
+)
+def test_openai_failures_log_safe_diagnostic_metadata(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: Exception,
+    exception_name: str,
+    status_code: str,
+    request_id: str,
+) -> None:
+    mock_llm(monkeypatch, [error])
+
+    with caplog.at_level(logging.ERROR, logger="ai_task_assistant.services.openai_provider"):
+        response = client.post("/chat", json={"message": "private user message"})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "AI service is temporarily unavailable"}
+    assert f"stage=initial_response exception={exception_name}" in caplog.text
+    assert f"status_code={status_code}" in caplog.text
+    assert f"request_id={request_id}" in caplog.text
+    assert "sensitive error content" not in caplog.text
+    assert "private user message" not in caplog.text
+
+
+def test_tool_execution_failure_logs_safe_diagnostic_metadata(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def raise_database_error(*args, **kwargs):
+        raise RuntimeError("sensitive database details must not be logged")
+
+    monkeypatch.setattr(ai_service.task_service, "create_task", raise_database_error)
+    mock_llm(monkeypatch, [tool_call("create_task", {"title": "Private task"})])
+
+    with caplog.at_level(logging.ERROR, logger="ai_task_assistant.services.openai_provider"):
+        response = client.post("/chat", json={"message": "private user message"})
+
+    assert response.status_code == 503
+    assert "stage=tool_execution exception=RuntimeError status_code=none request_id=none" in caplog.text
+    assert "sensitive database details" not in caplog.text
+    assert "private user message" not in caplog.text
+
+
+def test_followup_response_failure_logs_its_stage(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    error = openai_status_error(RateLimitError, 429)
+    mock_llm(
+        monkeypatch,
+        [tool_call("list_tasks", {}), error],
+    )
+
+    with caplog.at_level(logging.ERROR, logger="ai_task_assistant.services.openai_provider"):
+        response = client.post("/chat", json={"message": "private user message"})
+
+    assert response.status_code == 503
+    assert "stage=followup_response exception=RateLimitError" in caplog.text
+    assert "request_id=req_diagnostic_123" in caplog.text
+    assert "sensitive error content" not in caplog.text
+    assert "private user message" not in caplog.text
 
 
 def test_conversation_first_turn_saves_final_response_id(

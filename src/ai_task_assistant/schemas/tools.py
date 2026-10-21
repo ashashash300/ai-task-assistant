@@ -85,3 +85,7 @@ class UpdateTaskToolArguments(ToolArguments):
 
 class CompleteTaskToolArguments(ToolArguments):
     task_id: int = Field(gt=0)
+
+
+class DeleteTaskToolArguments(ToolArguments):
+    task_id: int = Field(gt=0)

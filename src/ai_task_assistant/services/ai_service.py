@@ -2,7 +2,6 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from openai import BadRequestError, NotFoundError, OpenAI
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
@@ -13,10 +12,20 @@ from ai_task_assistant.schemas.task import TaskCreate, TaskUpdate
 from ai_task_assistant.schemas.tools import (
     CompleteTaskToolArguments,
     CreateTaskToolArguments,
+    DeleteTaskToolArguments,
     ListTasksToolArguments,
     UpdateTaskToolArguments,
 )
 from ai_task_assistant.services import task_service
+from ai_task_assistant.services.conversation_service import PendingDeletionRequest
+from ai_task_assistant.services.llm_provider import (
+    LLMProvider,
+    ProviderContextError,
+    ProviderError,
+    ProviderNotImplementedError,
+)
+from ai_task_assistant.services.gemini_provider import GeminiProvider
+from ai_task_assistant.services.openai_provider import OpenAIProvider
 
 
 class AIServiceError(Exception):
@@ -30,41 +39,8 @@ class ConversationContextError(AIServiceError):
 @dataclass
 class ChatResult:
     response: str
-    response_id: str
-
-
-TOOL_DEFINITIONS = [
-    {
-        "type": "function",
-        "name": "create_task",
-        "description": "Create a new todo task when the user asks to add a reminder or task.",
-        "parameters": CreateTaskToolArguments.model_json_schema(),
-    },
-    {
-        "type": "function",
-        "name": "list_tasks",
-        "description": "List tasks. Optionally filter by status or due-date range.",
-        "parameters": ListTasksToolArguments.model_json_schema(),
-    },
-    {
-        "type": "function",
-        "name": "update_task",
-        "description": "Update fields on an existing task identified by task_id.",
-        "parameters": UpdateTaskToolArguments.model_json_schema(),
-    },
-    {
-        "type": "function",
-        "name": "complete_task",
-        "description": "Mark an existing task as completed using task_id.",
-        "parameters": CompleteTaskToolArguments.model_json_schema(),
-    },
-]
-
-
-def get_openai_client() -> OpenAI:
-    if not settings.openai_api_key:
-        raise AIServiceError("AI service is not configured")
-    return OpenAI(api_key=settings.openai_api_key)
+    conversation_state: object | None
+    pending_deletion: PendingDeletionRequest | None = None
 
 
 def serialize_task(task: Any) -> dict[str, Any]:
@@ -80,7 +56,13 @@ def serialize_task(task: Any) -> dict[str, Any]:
     }
 
 
-def execute_tool(db: Session, name: str, raw_arguments: str) -> dict[str, Any]:
+def execute_tool(
+    db: Session,
+    name: str,
+    raw_arguments: str,
+    conversation_id: str | None = None,
+    pending_deletion: list[PendingDeletionRequest | None] | None = None,
+) -> dict[str, Any]:
     """Validate a tool call and delegate all task work to Task Service."""
 
     try:
@@ -131,18 +113,47 @@ def execute_tool(db: Session, name: str, raw_arguments: str) -> dict[str, Any]:
                 TaskUpdate(status=TaskStatus.COMPLETED),
             )
             return {"ok": True, "task": serialize_task(completed_task)}
+
+        if name == "delete_task":
+            args = DeleteTaskToolArguments.model_validate(arguments)
+            if conversation_id is None or pending_deletion is None:
+                return {
+                    "ok": False,
+                    "error": "A conversation_id is required to request task deletion",
+                }
+            if pending_deletion[0] is not None:
+                return {"ok": False, "error": "Only one task deletion can be requested at a time"}
+            task = task_service.get_task(db, args.task_id)
+            if task is None:
+                return {"ok": False, "error": "Task not found"}
+            pending_deletion[0] = PendingDeletionRequest(task_id=task.id, title=task.title)
+            return {
+                "ok": True,
+                "confirmation_required": True,
+                "task": {"id": task.id, "title": task.title},
+            }
     except ValidationError:
         return {"ok": False, "error": "Invalid tool arguments"}
 
     return {"ok": False, "error": "Unknown tool"}
 
 
-def run_chat(
-    db: Session, message: str, previous_response_id: str | None = None
-) -> ChatResult:
-    """Run one tool-calling turn without giving the LLM database access."""
+def get_provider() -> LLMProvider:
+    if settings.ai_provider == "openai":
+        return OpenAIProvider()
+    if settings.ai_provider == "gemini":
+        return GeminiProvider()
+    raise ProviderNotImplementedError("AI provider is not implemented")
 
-    client = get_openai_client()
+
+def run_chat(
+    db: Session,
+    message: str,
+    conversation_state: object | None = None,
+    conversation_id: str | None = None,
+) -> ChatResult:
+    """Run one provider turn without giving the LLM database access."""
+
     current_time = current_taipei_time().isoformat()
     system_prompt = (
         "You are a helpful task assistant. Use the available tools for task "
@@ -155,56 +166,29 @@ def run_chat(
         "a tool, due_date must be an ISO 8601 datetime with the +08:00 offset. "
         "If required task details are missing, or a task reference is ambiguous, ask "
         "a clarifying question and do not create, update, complete, or delete a task."
+        " For delete_task, only request deletion for an explicit task_id. The backend will ask "
+        "the user to confirm and will not delete the task from this tool call."
     )
-    conversation: list[Any] = [
-        {
-            "role": "system",
-            "content": system_prompt,
-        },
-        {"role": "user", "content": message},
-    ]
-
+    pending_deletion: list[PendingDeletionRequest | None] = [None]
     try:
-        request_options: dict[str, Any] = {
-            "model": settings.openai_model,
-            "input": conversation,
-            "tools": TOOL_DEFINITIONS,
-        }
-        if previous_response_id is not None:
-            request_options["previous_response_id"] = previous_response_id
-
-        response = client.responses.create(
-            **request_options
+        result = get_provider().run_turn(
+            message=message,
+            system_prompt=system_prompt,
+            conversation_state=conversation_state,
+            execute_tool=lambda name, raw_arguments: execute_tool(
+                db,
+                name,
+                raw_arguments,
+                conversation_id=conversation_id,
+                pending_deletion=pending_deletion,
+            ),
         )
-        tool_calls = [item for item in response.output if item.type == "function_call"]
-        if not tool_calls:
-            return ChatResult(response=response.output_text, response_id=response.id)
-
-        tool_outputs: list[Any] = []
-        for tool_call in tool_calls:
-            result = execute_tool(db, tool_call.name, tool_call.arguments)
-            tool_outputs.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": tool_call.call_id,
-                    "output": json.dumps(result, ensure_ascii=False),
-                }
-            )
-
-        final_response = client.responses.create(
-            model=settings.openai_model,
-            input=[{"role": "system", "content": system_prompt}, *tool_outputs],
-            tools=TOOL_DEFINITIONS,
-            previous_response_id=response.id,
+        return ChatResult(
+            response=result.response,
+            conversation_state=result.conversation_state,
+            pending_deletion=pending_deletion[0],
         )
-        return ChatResult(response=final_response.output_text, response_id=final_response.id)
-    except AIServiceError:
-        raise
-    except (BadRequestError, NotFoundError) as error:
-        if previous_response_id is not None:
-            raise ConversationContextError(
-                "Conversation context is unavailable. Start a new conversation_id."
-            ) from error
-        raise AIServiceError("AI service is temporarily unavailable") from error
-    except Exception as error:
-        raise AIServiceError("AI service is temporarily unavailable") from error
+    except ProviderContextError as error:
+        raise ConversationContextError(str(error)) from error
+    except ProviderError as error:
+        raise AIServiceError(str(error)) from error
