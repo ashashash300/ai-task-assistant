@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-2.5-flash"
     gemini_history_turns: int = Field(default=5, ge=1, le=10)
+    conversation_retention_days: int = Field(default=30, ge=1)
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @field_validator("gemini_model")

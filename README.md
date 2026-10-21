@@ -17,7 +17,7 @@ Dates and times use **Asia/Taipei** application semantics. API responses expose 
 - Provider abstraction selected with `AI_PROVIDER`; there is no implicit provider fallback.
 - Pydantic validation of all LLM tool arguments before Task Service execution.
 - OpenAI multi-turn continuity with `previous_response_id`.
-- Gemini multi-turn continuity with in-memory structured conversation history.
+- SQLite-persisted multi-turn state for OpenAI response IDs and Gemini structured history.
 - Conversation isolation by `conversation_id`, with provider mismatch protection.
 - Asia/Taipei-aware due-date validation, normalization, filtering, and response serialization.
 - Backend-enforced two-step confirmation for chat-based task deletion.
@@ -57,7 +57,7 @@ The Vite development server proxies `/api/chat` to `/chat` and `/api/tasks` to `
 ## How AI Tool Calling Works
 
 1. The client sends a user message to `POST /chat`.
-2. The chat route loads the optional in-memory conversation state and calls `AIService.run_chat()`.
+2. The chat route loads the optional persisted conversation state and calls `AIService.run_chat()`.
 3. The selected provider receives the message, current Asia/Taipei time, and the available tools: `create_task`, `list_tasks`, `update_task`, `complete_task`, and `delete_task`.
 4. A provider function call is passed to the backend callback as untrusted input.
 5. `execute_tool()` parses and validates the arguments with the corresponding Pydantic tool schema.
@@ -68,14 +68,16 @@ Both providers support multiple function calls in one turn. Gemini disables SDK 
 
 ## Conversation Management
 
-`conversation_id` is optional. Without it, `POST /chat` is stateless. With a valid ID, the backend keeps state only in process memory:
+`conversation_id` is optional. Without it, `POST /chat` is stateless. With a valid ID, the backend persists provider-specific conversation state in SQLite:
 
 - IDs must be 1–64 characters and use letters, numbers, hyphens, or underscores.
 - At most **100 conversations** and **10 successful turns per conversation** are retained.
-- OpenAI stores the final response ID and supplies it as `previous_response_id` on the next turn.
-- Gemini stores structured user, model, function-call, and function-response history in `ConversationState.provider_state`.
+- OpenAI stores the final response ID and supplies it as `previous_response_id` on the next turn. Remote OpenAI response state can still expire independently.
+- Gemini stores versioned JSON for structured user, model, function-call, and function-response history. The codec rejects invalid or incomplete tool-call pairs rather than silently discarding them.
 - Gemini retains the newest complete history turns only. `GEMINI_HISTORY_TURNS` is configurable from **1 to 10** and defaults to **5**. A function call is never kept without its matching function response.
 - A `conversation_id` cannot resume under a different provider; the API returns HTTP 409 instead of mixing contexts.
+- `CONVERSATION_RETENTION_DAYS` defaults to **30** and must be positive. When a new or already-expired conversation ID is used, the backend synchronously removes conversations with `updated_at` strictly older than the Taipei-time cutoff before checking the 100-conversation limit. Tasks are never removed by this cleanup.
+- A cleaned `conversation_id` starts a new conversation. A stale in-flight request can only update with its expected `state_version`; if cleanup removed it first, the request returns HTTP 409 and cannot revive the old state.
 
 The frontend creates a valid ID per browser page load and reuses it for that page session. Refreshing the page creates a new frontend conversation ID.
 
@@ -108,7 +110,7 @@ ai-task-assistant/
 │   │   ├── ai_service.py          # Shared prompt and validated tool execution
 │   │   ├── openai_provider.py     # OpenAI Responses API implementation
 │   │   ├── gemini_provider.py     # Gemini generate_content implementation
-│   │   ├── conversation_service.py# In-memory state and deletion requests
+│   │   ├── conversation_service.py# SQLite conversation state, retention, deletion requests
 │   │   └── task_service.py        # Task business/data operations
 │   └── main.py                    # FastAPI application and /health
 ├── tests/                         # Backend unit and API tests
@@ -152,7 +154,8 @@ Settings are loaded from environment variables and, for local development, from 
 | `OPENAI_MODEL` | `gpt-4.1-mini` | Model passed to the OpenAI Responses API. |
 | `GEMINI_API_KEY` | unset | Required only when `AI_PROVIDER=gemini`. Keep it on the backend. |
 | `GEMINI_MODEL` | `gemini-2.5-flash`; non-empty string | Model passed to Gemini `generate_content`. |
-| `GEMINI_HISTORY_TURNS` | `5`; integer from `1` to `10` | Number of complete recent Gemini turns retained in memory. |
+| `GEMINI_HISTORY_TURNS` | `5`; integer from `1` to `10` | Number of complete recent Gemini turns retained in persisted history. |
+| `CONVERSATION_RETENTION_DAYS` | `30`; positive integer | Days to retain persisted conversations before synchronous cleanup. |
 
 For example, a local Gemini configuration can use a model that has been manually validated during development:
 
@@ -271,10 +274,12 @@ Verify `http://127.0.0.1:8000/health` after startup. Docker image build and runt
 ## Limitations and Future Improvements
 
 - Authentication and authorization are not implemented.
-- Conversation history and pending deletion requests are in memory only; both disappear after an application restart and are not shared between processes.
+- Conversation state persists in SQLite, but pending deletion authorization remains process-local and disappears after an application restart. It is deliberately not restored from Gemini/OpenAI history.
 - The application is designed for a local demo, not for direct public deployment or a multi-user environment.
 - `conversation_id` is an identifier, not an access-control mechanism.
 - Gemini history is limited by complete turns, not an exact token budget.
+- `Base.metadata.create_all()` creates missing tables only; it is not a schema migration system. Existing databases need a deliberate migration before any future model-column change.
+- Task CRUD executed during tool calling and the final conversation-state write are separate transactions. A later provider or optimistic-lock conflict cannot roll back an already completed task operation.
 - SQLite is appropriate for this portfolio scope but is not a substitute for production data, migration, backup, concurrency, or tenant-isolation design.
 - API keys must remain server-side. Provider usage may incur cost depending on the selected model and account plan.
 - Potential next steps include persistent authenticated users, durable conversation storage, stricter rate limiting, observability, frontend tests, and production deployment design.

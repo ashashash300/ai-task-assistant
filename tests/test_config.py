@@ -46,6 +46,18 @@ def test_google_genai_sdk_can_be_imported() -> None:
     assert genai is not None
 
 
+def test_conversation_retention_defaults_to_thirty_days() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.conversation_retention_days == 30
+
+
+@pytest.mark.parametrize("retention_days", [0, -1])
+def test_conversation_retention_must_be_positive(retention_days: int) -> None:
+    with pytest.raises(ValidationError, match="conversation_retention_days"):
+        Settings(_env_file=None, conversation_retention_days=retention_days)
+
+
 @pytest.mark.parametrize("history_turns", [0, 11])
 def test_gemini_history_turn_limit_is_validated(history_turns: int) -> None:
     with pytest.raises(ValidationError, match="gemini_history_turns"):

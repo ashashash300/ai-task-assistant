@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from google.genai import types
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -11,7 +12,9 @@ from sqlalchemy.pool import StaticPool
 from ai_task_assistant.core.config import settings
 from ai_task_assistant.db.base import Base
 from ai_task_assistant.db.session import get_db
+import ai_task_assistant.main as main_module
 from ai_task_assistant.main import app
+from ai_task_assistant.models.conversation import Conversation
 from ai_task_assistant.services import ai_service, conversation_service, gemini_provider
 
 
@@ -52,13 +55,19 @@ def client() -> Generator[TestClient, None, None]:
         finally:
             db.close()
 
-    conversation_service.clear_conversations()
+    conversation_service.clear_pending_deletions()
     app.dependency_overrides[get_db] = override_get_db
-    with TestClient(app) as test_client:
-        yield test_client
-    app.dependency_overrides.clear()
-    conversation_service.clear_conversations()
-    Base.metadata.drop_all(bind=test_engine)
+    original_engine = main_module.engine
+    main_module.engine = test_engine
+    try:
+        with TestClient(app) as test_client:
+            test_client.conversation_session_factory = test_session
+            yield test_client
+    finally:
+        main_module.engine = original_engine
+        app.dependency_overrides.clear()
+        conversation_service.clear_pending_deletions()
+        Base.metadata.drop_all(bind=test_engine)
 
 
 def gemini_text(text: str) -> object:
@@ -90,6 +99,11 @@ def mock_gemini(monkeypatch: pytest.MonkeyPatch, responses: list[object]) -> Moc
     monkeypatch.setattr(settings, "ai_provider", "gemini")
     monkeypatch.setattr(gemini_provider, "get_gemini_client", lambda: mock_client)
     return mock_client
+
+
+def get_persisted_conversation(client: TestClient, conversation_id: str):
+    with client.conversation_session_factory() as db:
+        return conversation_service.get_conversation(db, conversation_id)
 
 
 def test_gemini_plain_text_response_uses_manual_tool_execution_config(
@@ -186,6 +200,56 @@ def test_gemini_delete_tool_creates_confirmation_without_deleting(
     assert client.get(f"/tasks/{task['id']}").status_code == 404
 
 
+def test_persisted_gemini_delete_history_cannot_authorize_after_restart(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only process-local pending state can authorize the second deletion step."""
+
+    task = client.post("/tasks", json={"title": "Persisted Gemini delete"}).json()
+    history = [
+        types.Content(role="user", parts=[types.Part.from_text(text="刪除任務")]),
+        types.Content(
+            role="model",
+            parts=[
+                types.Part.from_function_call(
+                    name="delete_task", args={"task_id": task["id"]}
+                )
+            ],
+        ),
+        types.Content(
+            role="user",
+            parts=[
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name="delete_task",
+                        response={"ok": True, "task_id": task["id"]},
+                    )
+                )
+            ],
+        ),
+        types.Content(role="model", parts=[types.Part.from_text(text="請確認刪除。")]),
+    ]
+    with client.conversation_session_factory() as db:
+        conversation_service.save_response(
+            db,
+            "persisted-gemini-delete",
+            history,
+            "gemini",
+            expected_state_version=None,
+        )
+    # The fixture starts with an empty pending-deletion store, equivalent to a restart.
+    mock_gemini(monkeypatch, [gemini_text("請重新提出刪除要求。")])
+
+    response = client.post(
+        "/chat",
+        json={"conversation_id": "persisted-gemini-delete", "message": "確認"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["response"] == "請重新提出刪除要求。"
+    assert client.get(f"/tasks/{task['id']}").status_code == 200
+
+
 def test_gemini_tool_definitions_include_delete_task() -> None:
     names = [declaration.name for declaration in gemini_provider.GEMINI_TOOLS[0].function_declarations]
 
@@ -255,7 +319,7 @@ def test_gemini_conversation_history_is_reused_for_next_turn(
     assert second.status_code == 200
     assert client.get("/tasks/1").json()["priority"] == "high"
     assert len(mock_client.models.calls[2]["contents"]) > 1
-    state = conversation_service.get_conversation("gemini-demo")
+    state = get_persisted_conversation(client, "gemini-demo")
     assert state is not None
     assert state.provider == "gemini"
     assert state.last_response_id is None
@@ -324,16 +388,16 @@ def test_gemini_failure_does_not_mutate_saved_history(
 ) -> None:
     mock_gemini(monkeypatch, [gemini_text("第一輪回覆。"), RuntimeError("network failure")])
     first = client.post("/chat", json={"conversation_id": "stable", "message": "第一輪"})
-    state_before = conversation_service.get_conversation("stable")
+    state_before = get_persisted_conversation(client, "stable")
     assert first.status_code == 200
     assert state_before is not None
     history_before = [content.model_dump() for content in state_before.provider_state]
 
     second = client.post("/chat", json={"conversation_id": "stable", "message": "失敗輪"})
 
-    state_after = conversation_service.get_conversation("stable")
+    state_after = get_persisted_conversation(client, "stable")
     assert second.status_code == 503
-    assert state_after is state_before
+    assert state_after == state_before
     assert state_after.turn_count == 1
     assert [content.model_dump() for content in state_after.provider_state] == history_before
 
@@ -364,6 +428,51 @@ def test_conversation_provider_mismatch_returns_conflict(
     assert response.status_code == 409
     assert response.json() == {
         "detail": "Conversation provider does not match. Start a new conversation_id."
+    }
+
+
+@pytest.mark.parametrize(
+    "history_payload",
+    [
+        {"schema_version": 1, "contents": [{"role": "user"}]},
+        {"schema_version": 2, "contents": []},
+        {
+            "schema_version": 1,
+            "contents": [
+                {"role": "user", "parts": [{"text": "list tasks"}]},
+                {
+                    "role": "model",
+                    "parts": [
+                        {"function_call": {"name": "list_tasks", "args": {}}}
+                    ],
+                },
+            ],
+        },
+    ],
+)
+def test_invalid_persisted_gemini_history_returns_conflict(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, history_payload: dict
+) -> None:
+    with client.conversation_session_factory() as db:
+        db.add(
+            Conversation(
+                conversation_id="corrupt-gemini-history",
+                provider="gemini",
+                gemini_history_json=history_payload,
+                turn_count=1,
+            )
+        )
+        db.commit()
+    monkeypatch.setattr(settings, "ai_provider", "gemini")
+
+    response = client.post(
+        "/chat",
+        json={"conversation_id": "corrupt-gemini-history", "message": "繼續"},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "Conversation context is unavailable. Start a new conversation_id."
     }
 
 

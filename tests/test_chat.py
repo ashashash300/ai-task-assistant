@@ -22,6 +22,8 @@ from sqlalchemy.pool import StaticPool
 
 from ai_task_assistant.db.base import Base
 from ai_task_assistant.db.session import get_db
+import ai_task_assistant.api.routes.chat as chat_route
+import ai_task_assistant.main as main_module
 from ai_task_assistant.main import app
 from ai_task_assistant.services import ai_service
 from ai_task_assistant.core.config import settings
@@ -65,13 +67,19 @@ def client() -> Generator[TestClient, None, None]:
         finally:
             db.close()
 
-    conversation_service.clear_conversations()
+    conversation_service.clear_pending_deletions()
     app.dependency_overrides[get_db] = override_get_db
-    with TestClient(app) as test_client:
-        yield test_client
-    app.dependency_overrides.clear()
-    conversation_service.clear_conversations()
-    Base.metadata.drop_all(bind=test_engine)
+    original_engine = main_module.engine
+    main_module.engine = test_engine
+    try:
+        with TestClient(app) as test_client:
+            test_client.conversation_session_factory = test_session
+            yield test_client
+    finally:
+        main_module.engine = original_engine
+        app.dependency_overrides.clear()
+        conversation_service.clear_pending_deletions()
+        Base.metadata.drop_all(bind=test_engine)
 
 
 def tool_call(name: str, arguments: dict, response_id: str = "resp_tool") -> object:
@@ -113,6 +121,24 @@ def mock_llm(monkeypatch: pytest.MonkeyPatch, responses: list[object]) -> MockOp
     monkeypatch.setattr(settings, "ai_provider", "openai")
     monkeypatch.setattr(openai_provider, "get_openai_client", lambda: mock_client)
     return mock_client
+
+
+def get_persisted_conversation(client: TestClient, conversation_id: str):
+    with client.conversation_session_factory() as db:
+        return conversation_service.get_conversation(db, conversation_id)
+
+
+def save_persisted_openai_conversation(
+    client: TestClient, conversation_id: str, response_id: str
+) -> None:
+    with client.conversation_session_factory() as db:
+        conversation_service.save_response(
+            db,
+            conversation_id,
+            response_id,
+            "openai",
+            expected_state_version=None,
+        )
 
 
 def test_chat_request_validation(client: TestClient) -> None:
@@ -460,6 +486,33 @@ def test_confirmation_without_pending_deletion_cannot_delete_task(
     assert client.get(f"/tasks/{task['id']}").status_code == 200
 
 
+def test_pending_deletion_expires_after_application_restart(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = client.post("/tasks", json={"title": "Restart-safe task"}).json()
+    mock_llm(
+        monkeypatch,
+        [
+            tool_call("delete_task", {"task_id": task["id"]}),
+            final_response("請確認刪除。", "resp_delete_request"),
+            final_response("請重新提出刪除要求。", "resp_after_restart"),
+        ],
+    )
+    client.post(
+        "/chat", json={"conversation_id": "restart-delete", "message": "刪除任務"}
+    )
+
+    # Simulate a process restart: persisted conversation remains, pending authorization does not.
+    conversation_service.clear_pending_deletions()
+    response = client.post(
+        "/chat", json={"conversation_id": "restart-delete", "message": "確認"}
+    )
+
+    assert response.status_code == 200
+    assert client.get(f"/tasks/{task['id']}").status_code == 200
+    assert conversation_service.get_pending_deletion("restart-delete") is None
+
+
 def test_pending_deletions_are_isolated_by_conversation_id(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -713,7 +766,7 @@ def test_conversation_first_turn_saves_final_response_id(
         "conversation_id": "demo-001",
         "response": "已建立對話。",
     }
-    state = conversation_service.get_conversation("demo-001")
+    state = get_persisted_conversation(client, "demo-001")
     assert state is not None
     assert state.last_response_id == "resp_first_final"
     assert state.turn_count == 1
@@ -737,8 +790,8 @@ def test_same_conversation_sends_previous_response_id(
     assert response.status_code == 200
     assert mock_client.responses.calls[0].get("previous_response_id") is None
     assert mock_client.responses.calls[1]["previous_response_id"] == "resp_first"
-    assert conversation_service.get_conversation("demo-001").last_response_id == "resp_second"
-    assert conversation_service.get_conversation("demo-001").turn_count == 2
+    assert get_persisted_conversation(client, "demo-001").last_response_id == "resp_second"
+    assert get_persisted_conversation(client, "demo-001").turn_count == 2
 
 
 def test_tool_turn_stores_final_response_id_not_intermediate_id(
@@ -758,7 +811,7 @@ def test_tool_turn_stores_final_response_id_not_intermediate_id(
 
     assert response.status_code == 200
     assert mock_client.responses.calls[1]["previous_response_id"] == "resp_intermediate"
-    assert conversation_service.get_conversation("demo-001").last_response_id == "resp_final"
+    assert get_persisted_conversation(client, "demo-001").last_response_id == "resp_final"
 
 
 def test_conversation_ids_are_isolated(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -823,7 +876,7 @@ def test_task_service_failure_does_not_update_conversation_state(
 
     assert response.status_code == 503
     assert response.json() == {"detail": "AI service is temporarily unavailable"}
-    assert conversation_service.get_conversation("service-failure") is None
+    assert get_persisted_conversation(client, "service-failure") is None
 
 
 def test_omitted_conversation_id_remains_stateless(
@@ -841,7 +894,7 @@ def test_omitted_conversation_id_remains_stateless(
     assert second.json() == {"response": "第二輪"}
     assert "previous_response_id" not in mock_client.responses.calls[0]
     assert "previous_response_id" not in mock_client.responses.calls[1]
-    assert conversation_service.get_conversation("demo-001") is None
+    assert get_persisted_conversation(client, "demo-001") is None
 
 
 @pytest.mark.parametrize("conversation_id", ["", "   ", "demo id", "demo!001", "x" * 65])
@@ -865,7 +918,7 @@ def test_conversation_turn_limit_rejects_next_request_without_calling_llm(
         )
         assert response.status_code == 200
 
-    state_before = conversation_service.get_conversation("limited")
+    state_before = get_persisted_conversation(client, "limited")
     response = client.post("/chat", json={"conversation_id": "limited", "message": "第十一輪"})
 
     assert response.status_code == 409
@@ -873,14 +926,14 @@ def test_conversation_turn_limit_rejects_next_request_without_calling_llm(
         "detail": "Conversation turn limit reached. Start a new conversation_id."
     }
     assert len(mock_client.responses.calls) == conversation_service.MAX_TURNS_PER_CONVERSATION
-    assert conversation_service.get_conversation("limited") == state_before
+    assert get_persisted_conversation(client, "limited") == state_before
 
 
 def test_conversation_count_limit_rejects_new_conversation_without_calling_llm(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     for index in range(conversation_service.MAX_CONVERSATIONS):
-        conversation_service.save_response(f"conversation-{index}", f"resp-{index}")
+        save_persisted_openai_conversation(client, f"conversation-{index}", f"resp-{index}")
     mock_client = mock_llm(monkeypatch, [])
 
     response = client.post(
@@ -894,10 +947,37 @@ def test_conversation_count_limit_rejects_new_conversation_without_calling_llm(
     assert mock_client.responses.calls == []
     assert len(
         [
-            conversation_service.get_conversation(f"conversation-{index}")
+            get_persisted_conversation(client, f"conversation-{index}")
             for index in range(conversation_service.MAX_CONVERSATIONS)
         ]
     ) == conversation_service.MAX_CONVERSATIONS
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Conversation was updated by another request. Retry the request.",
+        "Conversation was created by another request. Retry the request.",
+    ],
+)
+def test_conversation_save_conflicts_return_http_409(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    message: str,
+) -> None:
+    mock_llm(monkeypatch, [final_response("完成")])
+
+    def raise_conflict(*args, **kwargs):
+        raise conversation_service.ConversationConflictError(message)
+
+    monkeypatch.setattr(chat_route, "save_response", raise_conflict)
+
+    response = client.post(
+        "/chat", json={"conversation_id": "conflicted", "message": "繼續"}
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": message}
 
 
 def test_llm_failure_does_not_create_conversation_state(
@@ -910,7 +990,7 @@ def test_llm_failure_does_not_create_conversation_state(
     )
 
     assert response.status_code == 503
-    assert conversation_service.get_conversation("failed") is None
+    assert get_persisted_conversation(client, "failed") is None
 
 
 def test_tool_final_response_failure_does_not_create_conversation_state(
@@ -929,13 +1009,13 @@ def test_tool_final_response_failure_does_not_create_conversation_state(
     )
 
     assert response.status_code == 503
-    assert conversation_service.get_conversation("failed-tool") is None
+    assert get_persisted_conversation(client, "failed-tool") is None
 
 
 def test_stale_previous_response_id_is_not_overwritten(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    conversation_service.save_response("stale", "resp_stale")
+    save_persisted_openai_conversation(client, "stale", "resp_stale")
     stale_error = BadRequestError(
         "previous response not found",
         response=Response(400, request=Request("POST", "https://api.openai.com/v1/responses")),
@@ -950,7 +1030,7 @@ def test_stale_previous_response_id_is_not_overwritten(
         "detail": "Conversation context is unavailable. Start a new conversation_id."
     }
     assert mock_client.responses.calls[0]["previous_response_id"] == "resp_stale"
-    assert conversation_service.get_conversation("stale").last_response_id == "resp_stale"
+    assert get_persisted_conversation(client, "stale").last_response_id == "resp_stale"
 
 
 def test_multi_turn_task_update_uses_prior_tool_context(
@@ -989,7 +1069,7 @@ def test_multi_turn_task_update_uses_prior_tool_context(
     assert second.status_code == 200
     assert mock_client.responses.calls[2]["previous_response_id"] == "resp_turn_one"
     assert client.get("/tasks/1").json()["due_date"] == "2026-10-01T20:00:00+08:00"
-    assert conversation_service.get_conversation("interview").last_response_id == "resp_turn_two"
+    assert get_persisted_conversation(client, "interview").last_response_id == "resp_turn_two"
 
 
 def test_ambiguous_task_reference_requests_clarification(

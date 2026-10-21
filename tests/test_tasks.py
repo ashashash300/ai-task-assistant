@@ -10,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 
 from ai_task_assistant.db.base import Base
 from ai_task_assistant.db.session import get_db
+import ai_task_assistant.main as main_module
 from ai_task_assistant.main import app
 from ai_task_assistant.models.task import Task
 
@@ -32,10 +33,15 @@ def client() -> Generator[TestClient, None, None]:
             db.close()
 
     app.dependency_overrides[get_db] = override_get_db
-    with TestClient(app) as test_client:
-        yield test_client
-    app.dependency_overrides.clear()
-    Base.metadata.drop_all(bind=test_engine)
+    original_engine = main_module.engine
+    main_module.engine = test_engine
+    try:
+        with TestClient(app) as test_client:
+            yield test_client
+    finally:
+        main_module.engine = original_engine
+        app.dependency_overrides.clear()
+        Base.metadata.drop_all(bind=test_engine)
 
 
 def create_task(client: TestClient) -> dict:

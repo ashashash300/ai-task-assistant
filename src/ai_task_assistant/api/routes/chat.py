@@ -9,8 +9,11 @@ from ai_task_assistant.services.ai_service import (
     run_chat,
 )
 from ai_task_assistant.services.conversation_service import (
+    ConversationConflictError,
     ConversationLimitError,
     ConversationProviderMismatchError,
+    ConversationStateError,
+    ConversationStorageError,
     clear_pending_deletion,
     get_pending_deletion,
     prepare_conversation,
@@ -41,10 +44,12 @@ def _is_delete_intent(message: str) -> bool:
 def chat(chat_in: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
     try:
         conversation_state = (
-            prepare_conversation(chat_in.conversation_id, settings.ai_provider)
+            prepare_conversation(db, chat_in.conversation_id, settings.ai_provider)
             if chat_in.conversation_id
             else None
         )
+        # Release the read-only transaction before calling an external LLM provider.
+        db.rollback()
         if chat_in.conversation_id:
             pending_deletion = get_pending_deletion(chat_in.conversation_id)
             normalized_message = _normalized_message(chat_in.message)
@@ -78,7 +83,15 @@ def chat(chat_in: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
             conversation_id=chat_in.conversation_id,
         )
         if chat_in.conversation_id:
-            save_response(chat_in.conversation_id, result.conversation_state, settings.ai_provider)
+            save_response(
+                db,
+                chat_in.conversation_id,
+                result.conversation_state,
+                settings.ai_provider,
+                expected_state_version=(
+                    conversation_state.state_version if conversation_state else None
+                ),
+            )
             if result.pending_deletion:
                 save_pending_deletion(chat_in.conversation_id, result.pending_deletion)
                 return ChatResponse(
@@ -92,6 +105,13 @@ def chat(chat_in: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
     except ConversationProviderMismatchError as error:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+    except (ConversationStateError, ConversationConflictError) as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+    except ConversationStorageError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
+        ) from error
     except AIServiceError as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
