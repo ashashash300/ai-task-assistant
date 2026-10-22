@@ -11,6 +11,20 @@ export interface ChatResponse {
   response: string;
 }
 
+export interface User {
+  id: number;
+  email: string;
+}
+
+export interface CredentialsRequest {
+  email: string;
+  password: string;
+}
+
+export interface CsrfTokenResponse {
+  csrf_token: string;
+}
+
 export interface Task {
   id: number;
   title: string;

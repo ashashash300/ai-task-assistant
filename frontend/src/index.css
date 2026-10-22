@@ -3,11 +3,14 @@
 :root { font-family: "DM Sans", "Noto Sans TC", system-ui, sans-serif; color: #192231; background: #f5f7fb; font-synthesis: none; text-rendering: optimizeLegibility; }
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; }
-button, textarea { font: inherit; }
+button, textarea, input { font: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: 0.6; }
 .app-shell { width: min(100% - 2rem, 1240px); margin: 0 auto; padding: 3.5rem 0; }
 .page-header { margin-bottom: 2rem; }
+.page-header-row { display: flex; align-items: start; justify-content: space-between; gap: 1rem; }
+.account-actions { display: flex; align-items: center; gap: 0.75rem; color: #536174; font-size: 0.9rem; }
+.account-actions span { max-width: 22rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .eyebrow, .section-kicker { margin: 0; color: #4f5bd5; font-size: 0.75rem; font-weight: 700; letter-spacing: 0.11em; text-transform: uppercase; }
 .page-header h1 { margin: 0.45rem 0; font-size: clamp(2.25rem, 5vw, 3.8rem); letter-spacing: -0.06em; }
 .page-header > p:last-child { margin: 0; color: #657184; }
@@ -29,13 +32,14 @@ button:disabled { cursor: not-allowed; opacity: 0.6; }
 .chat-form { border-top: 1px solid #e6eaf0; padding-top: 1rem; }
 .chat-form label { display: block; margin-bottom: 0.5rem; font-size: 0.9rem; font-weight: 600; }
 textarea { width: 100%; resize: vertical; border: 1px solid #cbd3e0; border-radius: 0.75rem; padding: 0.75rem; color: inherit; line-height: 1.5; }
-textarea:focus { outline: 3px solid #dfe2ff; border-color: #5964d8; }
+textarea:focus, input:focus { outline: 3px solid #dfe2ff; border-color: #5964d8; }
 .form-footer { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; margin-top: 0.65rem; color: #6b7687; font-size: 0.78rem; }
 button { border: 0; border-radius: 0.65rem; padding: 0.6rem 0.85rem; background: #4f5bd5; color: #fff; font-weight: 700; }
 button:hover:not(:disabled) { background: #424db7; }
 .secondary-button { background: #f0f2f7; color: #374151; }
 .secondary-button:hover:not(:disabled) { background: #e3e7ee; }
 .error-message, .error-block { margin: 0 0 1rem; border-radius: 0.75rem; background: #fff0f0; color: #ab3030; padding: 0.75rem; line-height: 1.5; }
+.notice-message { margin: 0 0 1rem; border-radius: 0.75rem; background: #edf8f1; color: #1f7043; padding: 0.75rem; line-height: 1.5; }
 .error-block { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
 .error-block p { margin: 0; }
 .error-block button { background: #ab3030; }
@@ -52,5 +56,18 @@ button:hover:not(:disabled) { background: #424db7; }
 .task-metadata div { min-width: 0; }
 .task-metadata dt { color: #7b8697; font-size: 0.73rem; font-weight: 700; }
 .task-metadata dd { margin: 0.2rem 0 0; font-size: 0.85rem; font-weight: 600; }
-@media (max-width: 800px) { .app-shell { width: min(100% - 1.25rem, 640px); padding: 1.5rem 0; } .workspace-grid { grid-template-columns: 1fr; } .chat-panel { min-height: 500px; } }
+.auth-shell { display: grid; min-height: 100vh; place-items: center; padding: 1.25rem; }
+.auth-card { width: min(100%, 29rem); border: 1px solid #e0e5ee; border-radius: 1.25rem; background: #fff; box-shadow: 0 16px 36px rgb(31 42 55 / 0.08); padding: 2rem; }
+.auth-card h1 { margin: 0.4rem 0 0.65rem; font-size: 2rem; letter-spacing: -0.045em; }
+.auth-description { margin: 0; color: #657184; line-height: 1.6; }
+.auth-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem; margin: 1.5rem 0; padding: 0.3rem; border-radius: 0.8rem; background: #f0f2f7; }
+.auth-tab { background: transparent; color: #526074; }
+.auth-tab:hover:not(:disabled) { background: #e2e6ef; }
+.auth-tab.active { background: #fff; color: #3542bc; box-shadow: 0 1px 3px rgb(31 42 55 / 0.15); }
+.auth-form { display: grid; gap: 0.55rem; }
+.auth-form label { margin-top: 0.35rem; font-size: 0.9rem; font-weight: 600; }
+.auth-form input { width: 100%; border: 1px solid #cbd3e0; border-radius: 0.75rem; padding: 0.75rem; color: inherit; }
+.auth-form button { margin-top: 0.9rem; }
+.field-hint { margin: -0.15rem 0 0.1rem; color: #6b7687; font-size: 0.78rem; }
+@media (max-width: 800px) { .app-shell { width: min(100% - 1.25rem, 640px); padding: 1.5rem 0; } .page-header-row { align-items: stretch; flex-direction: column; } .account-actions { justify-content: space-between; } .workspace-grid { grid-template-columns: 1fr; } .chat-panel { min-height: 500px; } }
 @media (max-width: 430px) { .panel, .chat-panel, .tasks-panel { padding: 1rem; border-radius: 1rem; } .form-footer { align-items: flex-start; flex-direction: column; } .form-footer button { width: 100%; } .task-metadata { grid-template-columns: 1fr; } }

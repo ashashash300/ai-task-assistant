@@ -60,6 +60,8 @@ def execute_tool(
     db: Session,
     name: str,
     raw_arguments: str,
+    *,
+    user_id: int,
     conversation_id: str | None = None,
     pending_deletion: list[PendingDeletionRequest | None] | None = None,
 ) -> dict[str, Any]:
@@ -75,7 +77,8 @@ def execute_tool(
             args = CreateTaskToolArguments.model_validate(arguments)
             task = task_service.create_task(
                 db,
-                TaskCreate(
+                user_id=user_id,
+                task_in=TaskCreate(
                     title=args.title,
                     description=args.description,
                     due_date=args.due_date,
@@ -88,6 +91,7 @@ def execute_tool(
             args = ListTasksToolArguments.model_validate(arguments)
             tasks = task_service.list_tasks(
                 db,
+                user_id=user_id,
                 status=args.status,
                 due_after=args.due_after,
                 due_before=args.due_before,
@@ -96,22 +100,32 @@ def execute_tool(
 
         if name == "update_task":
             args = UpdateTaskToolArguments.model_validate(arguments)
-            task = task_service.get_task(db, args.task_id)
+            task = task_service.get_task(db, user_id=user_id, task_id=args.task_id)
             if task is None:
                 return {"ok": False, "error": "Task not found"}
-            updated_task = task_service.update_task(db, task, args.to_task_update())
+            updated_task = task_service.update_task(
+                db,
+                user_id=user_id,
+                task_id=args.task_id,
+                task_in=args.to_task_update(),
+            )
+            if updated_task is None:
+                return {"ok": False, "error": "Task not found"}
             return {"ok": True, "task": serialize_task(updated_task)}
 
         if name == "complete_task":
             args = CompleteTaskToolArguments.model_validate(arguments)
-            task = task_service.get_task(db, args.task_id)
+            task = task_service.get_task(db, user_id=user_id, task_id=args.task_id)
             if task is None:
                 return {"ok": False, "error": "Task not found"}
             completed_task = task_service.update_task(
                 db,
-                task,
-                TaskUpdate(status=TaskStatus.COMPLETED),
+                user_id=user_id,
+                task_id=args.task_id,
+                task_in=TaskUpdate(status=TaskStatus.COMPLETED),
             )
+            if completed_task is None:
+                return {"ok": False, "error": "Task not found"}
             return {"ok": True, "task": serialize_task(completed_task)}
 
         if name == "delete_task":
@@ -123,7 +137,7 @@ def execute_tool(
                 }
             if pending_deletion[0] is not None:
                 return {"ok": False, "error": "Only one task deletion can be requested at a time"}
-            task = task_service.get_task(db, args.task_id)
+            task = task_service.get_task(db, user_id=user_id, task_id=args.task_id)
             if task is None:
                 return {"ok": False, "error": "Task not found"}
             pending_deletion[0] = PendingDeletionRequest(task_id=task.id, title=task.title)
@@ -149,6 +163,8 @@ def get_provider() -> LLMProvider:
 def run_chat(
     db: Session,
     message: str,
+    *,
+    user_id: int,
     conversation_state: object | None = None,
     conversation_id: str | None = None,
 ) -> ChatResult:
@@ -179,6 +195,7 @@ def run_chat(
                 db,
                 name,
                 raw_arguments,
+                user_id=user_id,
                 conversation_id=conversation_id,
                 pending_deletion=pending_deletion,
             ),

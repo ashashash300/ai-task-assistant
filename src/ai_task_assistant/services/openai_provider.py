@@ -70,7 +70,11 @@ OPENAI_TOOL_DEFINITIONS = [
 def get_openai_client() -> OpenAI:
     if not settings.openai_api_key:
         raise ProviderError("AI service is not configured")
-    return OpenAI(api_key=settings.openai_api_key)
+    return OpenAI(
+        api_key=settings.openai_api_key,
+        timeout=settings.provider_request_timeout_seconds,
+        max_retries=0,
+    )
 
 
 def log_ai_failure(stage: str, error: Exception) -> None:
@@ -117,6 +121,7 @@ class OpenAIProvider:
                 "model": settings.openai_model,
                 "input": conversation,
                 "tools": OPENAI_TOOL_DEFINITIONS,
+                "max_output_tokens": settings.provider_max_output_tokens,
             }
             if conversation_state is not None:
                 request_options["previous_response_id"] = conversation_state
@@ -141,12 +146,15 @@ class OpenAIProvider:
                     }
                 )
 
+            if settings.provider_max_calls_per_chat < 2:
+                raise ProviderError("AI service is temporarily unavailable")
             stage = "followup_response"
             final_response = client.responses.create(
                 model=settings.openai_model,
                 input=[{"role": "system", "content": system_prompt}, *tool_outputs],
                 tools=OPENAI_TOOL_DEFINITIONS,
                 previous_response_id=response.id,
+                max_output_tokens=settings.provider_max_output_tokens,
             )
             return ProviderResult(
                 response=final_response.output_text,

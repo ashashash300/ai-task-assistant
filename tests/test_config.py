@@ -62,3 +62,35 @@ def test_conversation_retention_must_be_positive(retention_days: int) -> None:
 def test_gemini_history_turn_limit_is_validated(history_turns: int) -> None:
     with pytest.raises(ValidationError, match="gemini_history_turns"):
         Settings(_env_file=None, gemini_history_turns=history_turns)
+
+
+def test_authentication_session_settings_have_safe_defaults() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.session_ttl_hours == 24
+    assert settings.session_cookie_secure is True
+    assert settings.session_cookie_samesite == "lax"
+
+
+@pytest.mark.parametrize("ttl_hours", [0, -1, 721])
+def test_session_ttl_must_be_in_safe_range(ttl_hours: int) -> None:
+    with pytest.raises(ValidationError, match="session_ttl_hours"):
+        Settings(_env_file=None, session_ttl_hours=ttl_hours)
+
+
+@pytest.mark.parametrize(
+    "origins",
+    ["", "https://example.com/path", "http://example.com", "not-a-url"],
+)
+def test_auth_allowed_origins_rejects_invalid_values(origins: str) -> None:
+    with pytest.raises(ValidationError, match="auth_allowed_origins"):
+        Settings(_env_file=None, auth_allowed_origins=origins)
+
+
+def test_auth_allowed_origins_are_normalized() -> None:
+    settings = Settings(
+        _env_file=None,
+        auth_allowed_origins=" https://app.example.com/ , https://app.example.com ",
+    )
+
+    assert settings.auth_allowed_origin_values == ("https://app.example.com",)

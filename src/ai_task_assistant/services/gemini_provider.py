@@ -19,9 +19,6 @@ from ai_task_assistant.services.llm_provider import ProviderError, ProviderResul
 
 logger = logging.getLogger(__name__)
 
-MAX_TOOL_ROUNDS = 5
-
-
 GEMINI_TOOLS = [
     types.Tool(
         function_declarations=[
@@ -58,7 +55,13 @@ GEMINI_TOOLS = [
 def get_gemini_client() -> genai.Client:
     if not settings.gemini_api_key:
         raise ProviderError("AI service is not configured")
-    return genai.Client(api_key=settings.gemini_api_key)
+    return genai.Client(
+        api_key=settings.gemini_api_key,
+        http_options=types.HttpOptions(
+            timeout=settings.provider_request_timeout_seconds * 1000,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
 
 
 def log_gemini_failure(stage: str, error: Exception) -> None:
@@ -205,12 +208,17 @@ class GeminiProvider:
         config = types.GenerateContentConfig(
             system_instruction=system_prompt,
             tools=GEMINI_TOOLS,
+            max_output_tokens=settings.provider_max_output_tokens,
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
         stage = "initial_response"
 
         try:
-            for _ in range(MAX_TOOL_ROUNDS):
+            max_rounds = min(
+                settings.provider_max_tool_rounds,
+                settings.provider_max_calls_per_chat,
+            )
+            for _ in range(max_rounds):
                 history = _trim_history_for_request(history, settings.gemini_history_turns)
                 response = client.models.generate_content(
                     model=settings.gemini_model,
