@@ -1,15 +1,45 @@
 import { expect, test } from "@playwright/test";
 
+function isRegistrationPath(pathname: string): boolean {
+  return pathname === "/api/auth/register" || pathname === "/auth/register";
+}
+
+function waitForRegistrationResponse(page: import("@playwright/test").Page) {
+  const events: string[] = [];
+  const recordResponse = (response: import("@playwright/test").Response) => {
+    const pathname = new URL(response.url()).pathname;
+    if (response.request().method() === "POST" && pathname.includes("/auth/register")) {
+      events.push(`response ${pathname} ${response.status()}`);
+    }
+  };
+  const recordFailure = (request: import("@playwright/test").Request) => {
+    const pathname = new URL(request.url()).pathname;
+    if (request.method() === "POST" && pathname.includes("/auth/register")) {
+      events.push(`requestfailed ${pathname} ${request.failure()?.errorText ?? "unknown"}`);
+    }
+  };
+
+  page.on("response", recordResponse);
+  page.on("requestfailed", recordFailure);
+  return page.waitForResponse((response) => {
+    const pathname = new URL(response.url()).pathname;
+    return isRegistrationPath(pathname) && response.request().method() === "POST";
+  }, { timeout: 25_000 }).catch(() => {
+    const summary = events.length > 0 ? events.join(", ") : "none";
+    throw new Error(`Registration response was not observed; safe endpoint events: ${summary}`);
+  }).finally(() => {
+    page.off("response", recordResponse);
+    page.off("requestfailed", recordFailure);
+  });
+}
+
 async function registerAndLogin(page: import("@playwright/test").Page, email: string) {
   await page.goto("/");
   await page.getByRole("tab", { name: "註冊" }).click();
   await page.getByLabel("電子郵件").fill(email);
   await page.getByLabel("密碼", { exact: true }).fill("browser-e2e-password");
   await page.getByLabel("確認密碼", { exact: true }).fill("browser-e2e-password");
-  const registerResponse = page.waitForResponse((response) =>
-    new URL(response.url()).pathname === "/api/auth/register" &&
-    response.request().method() === "POST",
-  );
+  const registerResponse = waitForRegistrationResponse(page);
   await page.getByRole("button", { name: "建立帳號" }).click();
   expect((await registerResponse).status()).toBe(201);
   await expect(page.getByRole("heading", { name: "登入工作區" })).toBeVisible();
