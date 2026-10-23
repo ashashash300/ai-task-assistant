@@ -6,9 +6,13 @@ async function registerAndLogin(page: import("@playwright/test").Page, email: st
   await page.getByLabel("電子郵件").fill(email);
   await page.getByLabel("密碼", { exact: true }).fill("browser-e2e-password");
   await page.getByLabel("確認密碼", { exact: true }).fill("browser-e2e-password");
+  const registerResponse = page.waitForResponse((response) =>
+    new URL(response.url()).pathname === "/api/auth/register" &&
+    response.request().method() === "POST",
+  );
   await page.getByRole("button", { name: "建立帳號" }).click();
-  await expect(page.getByText("帳號已建立")).toBeVisible();
-  await page.getByRole("tab", { name: "登入" }).click();
+  expect((await registerResponse).status()).toBe(201);
+  await expect(page.getByRole("heading", { name: "登入工作區" })).toBeVisible();
   await page.getByLabel("電子郵件").fill(email);
   await page.getByLabel("密碼", { exact: true }).fill("browser-e2e-password");
   await page.getByRole("button", { name: "登入" }).click();
