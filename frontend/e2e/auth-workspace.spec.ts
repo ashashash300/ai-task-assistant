@@ -4,32 +4,57 @@ function isRegistrationPath(pathname: string): boolean {
   return pathname === "/api/auth/register" || pathname === "/auth/register";
 }
 
+function isCsrfPath(pathname: string): boolean {
+  return pathname === "/api/auth/csrf" || pathname === "/auth/csrf";
+}
+
 function waitForRegistrationResponse(page: import("@playwright/test").Page) {
   const events: string[] = [];
+  let consoleErrorCount = 0;
+  let pageErrorCount = 0;
+  const recordRequest = (request: import("@playwright/test").Request) => {
+    const pathname = new URL(request.url()).pathname;
+    if (isRegistrationPath(pathname) || isCsrfPath(pathname)) {
+      events.push(`request ${request.method()} ${pathname}`);
+    }
+  };
   const recordResponse = (response: import("@playwright/test").Response) => {
     const pathname = new URL(response.url()).pathname;
-    if (response.request().method() === "POST" && pathname.includes("/auth/register")) {
-      events.push(`response ${pathname} ${response.status()}`);
+    if (isRegistrationPath(pathname) || isCsrfPath(pathname)) {
+      events.push(`response ${response.request().method()} ${pathname} ${response.status()}`);
     }
   };
   const recordFailure = (request: import("@playwright/test").Request) => {
     const pathname = new URL(request.url()).pathname;
-    if (request.method() === "POST" && pathname.includes("/auth/register")) {
+    if (isRegistrationPath(pathname) || isCsrfPath(pathname)) {
       events.push(`requestfailed ${pathname} ${request.failure()?.errorText ?? "unknown"}`);
     }
   };
+  const recordConsole = (message: import("@playwright/test").ConsoleMessage) => {
+    if (message.type() === "error") consoleErrorCount += 1;
+  };
+  const recordPageError = () => { pageErrorCount += 1; };
 
+  page.on("request", recordRequest);
   page.on("response", recordResponse);
   page.on("requestfailed", recordFailure);
+  page.on("console", recordConsole);
+  page.on("pageerror", recordPageError);
   return page.waitForResponse((response) => {
     const pathname = new URL(response.url()).pathname;
     return isRegistrationPath(pathname) && response.request().method() === "POST";
   }, { timeout: 25_000 }).catch(() => {
     const summary = events.length > 0 ? events.join(", ") : "none";
-    throw new Error(`Registration response was not observed; safe endpoint events: ${summary}`);
+    throw new Error(
+      `Registration response was not observed; safe endpoint events: ${summary}; ` +
+      `console_errors=${consoleErrorCount}; page_errors=${pageErrorCount}`,
+    );
   }).finally(() => {
+    page.off("request", recordRequest);
     page.off("response", recordResponse);
     page.off("requestfailed", recordFailure);
+    page.off("console", recordConsole);
+    page.off("pageerror", recordPageError);
   });
 }
 
@@ -39,6 +64,10 @@ async function registerAndLogin(page: import("@playwright/test").Page, email: st
   await page.getByLabel("電子郵件").fill(email);
   await page.getByLabel("密碼", { exact: true }).fill("browser-e2e-password");
   await page.getByLabel("確認密碼", { exact: true }).fill("browser-e2e-password");
+  const form = page.locator("form.auth-form");
+  await expect(form).toHaveJSProperty("noValidate", false);
+  expect(await form.evaluate((element: HTMLFormElement) => element.checkValidity())).toBe(true);
+  await expect(page.getByRole("button", { name: "建立帳號" })).toBeEnabled();
   const registerResponse = waitForRegistrationResponse(page);
   await page.getByRole("button", { name: "建立帳號" }).click();
   expect((await registerResponse).status()).toBe(201);
