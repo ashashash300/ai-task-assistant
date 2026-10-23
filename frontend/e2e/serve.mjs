@@ -55,7 +55,9 @@ function spawnOwned(command, args, options) {
     stdio: "inherit",
   });
   child.once("error", (error) => {
-    console.error(`Failed to start E2E child process: ${error.message}`);
+    // Keep launcher output free of command-line arguments and environment
+    // values, which can contain test-only credentials.
+    console.error("[e2e-server] child_start_failed");
   });
   return child;
 }
@@ -67,6 +69,7 @@ let stopping = false;
 function stopOwnedChildren(exitCode = 0) {
   if (stopping) return;
   stopping = true;
+  console.log("[e2e-server] cleanup_requested");
   for (const child of [frontend, backend]) {
     if (child?.exitCode === null && !child.killed) child.kill("SIGTERM");
   }
@@ -113,11 +116,14 @@ try {
   });
   backend.once("exit", (code) => {
     if (!stopping) {
-      console.error(`The owned E2E backend exited unexpectedly (${code}).`);
+      console.error(`[e2e-server] backend_unexpected_exit code=${code ?? "signal"}`);
       stopOwnedChildren(1);
+    } else {
+      console.log(`[e2e-server] backend_stopped code=${code ?? "signal"}`);
     }
   });
   await waitFor(`http://127.0.0.1:${backendPort}/health`, "E2E backend");
+  console.log("[e2e-server] backend_ready");
 
   frontend = spawnOwned(process.execPath, [
     resolve(frontendDirectory, "node_modules", "vite", "bin", "vite.js"),
@@ -134,13 +140,18 @@ try {
   });
   frontend.once("exit", (code) => {
     if (!stopping) {
-      console.error(`The owned E2E frontend exited unexpectedly (${code}).`);
+      console.error(`[e2e-server] frontend_unexpected_exit code=${code ?? "signal"}`);
       stopOwnedChildren(1);
+    } else {
+      console.log(`[e2e-server] frontend_stopped code=${code ?? "signal"}`);
     }
   });
   await waitFor(`http://127.0.0.1:${frontendPort}`, "E2E frontend");
+  console.log("[e2e-server] frontend_ready");
 } catch (error) {
-  console.error(error instanceof Error ? error.message : "Unable to start E2E servers.");
+  // Startup errors sometimes contain a full URL. The phase diagnostics do not
+  // need it, so retain only a stable failure category in CI output.
+  console.error("[e2e-server] startup_failed");
   stopOwnedChildren(1);
 }
 
