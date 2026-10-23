@@ -4,13 +4,13 @@ async function registerAndLogin(page: import("@playwright/test").Page, email: st
   await page.goto("/");
   await page.getByRole("tab", { name: "註冊" }).click();
   await page.getByLabel("電子郵件").fill(email);
-  await page.getByLabel("密碼").fill("browser-e2e-password");
-  await page.getByLabel("確認密碼").fill("browser-e2e-password");
+  await page.getByLabel("密碼", { exact: true }).fill("browser-e2e-password");
+  await page.getByLabel("確認密碼", { exact: true }).fill("browser-e2e-password");
   await page.getByRole("button", { name: "建立帳號" }).click();
   await expect(page.getByText("帳號已建立")).toBeVisible();
   await page.getByRole("tab", { name: "登入" }).click();
   await page.getByLabel("電子郵件").fill(email);
-  await page.getByLabel("密碼").fill("browser-e2e-password");
+  await page.getByLabel("密碼", { exact: true }).fill("browser-e2e-password");
   await page.getByRole("button", { name: "登入" }).click();
   await expect(page.getByRole("heading", { name: "AI Task Assistant" })).toBeVisible();
 }
