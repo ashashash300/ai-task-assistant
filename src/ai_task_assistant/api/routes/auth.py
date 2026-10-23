@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from ai_task_assistant.api.dependencies.auth import (
     CSRF_COOKIE_NAME,
     SESSION_COOKIE_NAME,
-    require_allowed_origin,
+    reject_disallowed_origin,
     require_csrf_protection,
     require_current_user,
 )
@@ -79,7 +79,7 @@ def _rate_limit_response(error: RateLimitExceeded) -> HTTPException:
 def issue_csrf_token(
     request: Request,
     response: Response,
-    _origin: Annotated[str, Depends(require_allowed_origin)],
+    _origin: Annotated[str | None, Depends(reject_disallowed_origin)],
 ) -> CsrfTokenResponse:
     try:
         rate_limiter.consume(

@@ -216,6 +216,10 @@ def test_logout_revokes_the_current_session_and_clears_cookies(client: TestClien
 
 
 def test_csrf_and_origin_protection(client: TestClient) -> None:
+    missing_origin = client.post(
+        "/auth/register",
+        json={"email": "user@example.com", "password": "long-safe-password"},
+    )
     missing_csrf = client.post(
         "/auth/register",
         headers={"Origin": ALLOWED_ORIGIN},
@@ -228,6 +232,8 @@ def test_csrf_and_origin_protection(client: TestClient) -> None:
     )
     valid = register(client)
 
+    assert missing_origin.status_code == 403
+    assert missing_origin.json() == {"detail": "Request origin is not allowed"}
     assert missing_csrf.status_code == 403
     assert missing_csrf.json() == {
         "detail": {"code": CSRF_ERROR_CODE, "message": "CSRF validation failed"}
@@ -235,6 +241,21 @@ def test_csrf_and_origin_protection(client: TestClient) -> None:
     assert wrong_origin.status_code == 403
     assert wrong_origin.json() == {"detail": "Request origin is not allowed"}
     assert valid.status_code == 201
+
+
+def test_csrf_token_issuance_allows_missing_origin_but_rejects_disallowed_origin(client: TestClient) -> None:
+    # Browsers do not guarantee Origin on same-origin GET requests. This only
+    # issues an unreadable random token; mutations still require strict Origin
+    # validation and a matching CSRF cookie/header pair.
+    missing_origin = client.get("/auth/csrf")
+    allowed_origin = client.get("/auth/csrf", headers={"Origin": ALLOWED_ORIGIN})
+    disallowed_origin = client.get("/auth/csrf", headers={"Origin": "https://attacker.example"})
+
+    assert missing_origin.status_code == 200
+    assert missing_origin.json()["csrf_token"]
+    assert allowed_origin.status_code == 200
+    assert disallowed_origin.status_code == 403
+    assert disallowed_origin.json() == {"detail": "Request origin is not allowed"}
 
 
 def test_tasks_endpoint_requires_authentication_after_ownership_cutover(client: TestClient) -> None:

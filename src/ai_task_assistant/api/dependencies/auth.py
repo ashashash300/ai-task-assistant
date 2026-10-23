@@ -24,6 +24,19 @@ def require_allowed_origin(origin: Annotated[str | None, Header()] = None) -> st
     return origin
 
 
+def reject_disallowed_origin(origin: Annotated[str | None, Header()] = None) -> str | None:
+    """Reject an explicit cross-site Origin without requiring it on safe GETs.
+
+    Browsers do not guarantee an Origin header for a same-origin GET. Issuing a
+    random CSRF token without that header is safe because a cross-site page
+    cannot read the response, while every state-changing route still requires
+    an allowed Origin and a matching double-submit token.
+    """
+    if origin is not None and origin not in settings.auth_allowed_origin_values:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Request origin is not allowed")
+    return origin
+
+
 def require_csrf_protection(
     _origin: Annotated[str, Depends(require_allowed_origin)],
     csrf_cookie: Annotated[str | None, Cookie(alias=CSRF_COOKIE_NAME)] = None,
