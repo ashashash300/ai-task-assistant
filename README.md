@@ -295,6 +295,10 @@ GitHub Actions runs `python -m pip install -e ".[dev]"` and `python -m pytest` o
 
 The workflow also uses `npm ci`, runs Vitest and the TypeScript/Vite build, then installs Playwright Chromium for the isolated browser E2E job. Test providers are mocked; CI does not require real OpenAI or Gemini credentials.
 
+### Deterministic interview demo
+
+For a human-operated, temporary localhost demo that uses deterministic mock tool calling rather than a paid provider, see [Demo Guide](docs/demo.md). It is a separate, explicitly enabled launcher and never uses `.env` or the development SQLite database.
+
 ## API Endpoints
 
 | Method | Endpoint | Description |
