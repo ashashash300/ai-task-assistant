@@ -250,10 +250,11 @@ test("browser uses HttpOnly session cookies, CSRF, isolated tasks, mock chat, an
       await page.getByRole("button", { name: "傳送訊息" }).click();
       expect((await chatResponse).status()).toBe(200);
       await expect(page.getByText("Mock AI response")).toBeVisible();
-      await expect(page.getByRole("button", { name: "傳送訊息", exact: true })).toBeEnabled();
     });
     await diagnostics.runPhase("quota", async () => {
       const quotaResponse = waitForFinalMutationResponse(page, "/api/chat", "POST", 429);
+      await page.getByLabel("請告訴 AI 你要處理的任務").fill("測試配額");
+      await expect(page.getByRole("button", { name: "傳送訊息", exact: true })).toBeEnabled();
       await page.getByRole("button", { name: "傳送訊息" }).click();
       expect((await quotaResponse).status()).toBe(429);
       await expect(page.getByText("Chat quota exceeded")).toBeVisible();
