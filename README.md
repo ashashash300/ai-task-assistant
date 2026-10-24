@@ -1,8 +1,10 @@
 # AI Task Assistant
 
-AI Task Assistant is a full-stack portfolio project for managing todo tasks with natural language. A React interface talks to a FastAPI backend, which can use either OpenAI or Google Gemini for tool calling. The language model proposes an operation; the backend validates its arguments and delegates all task data work to the existing Task Service and SQLite database.
+AI Task Assistant is a full-stack AI application portfolio project. It combines a React workspace, a FastAPI backend, SQLite persistence, and provider-neutral LLM tool calling so authenticated users can manage tasks with either REST APIs or natural-language chat.
 
-This is intentionally a small, understandable project for demonstrating practical AI application engineering—not a production-ready multi-user task platform.
+The key design boundary is intentional: an LLM can request a typed tool call, but it never receives database access, chooses a user identity, or bypasses backend authorization. The backend validates every tool argument and executes data operations in the authenticated user's scope.
+
+> **Project status:** the application is not production-deployed. It is designed and tested as a single-process SQLite MVP; see [Current Limitations](#current-limitations) and [deployment security notes](docs/deployment-security.md) before considering deployment.
 
 ## Project Overview
 
@@ -21,8 +23,11 @@ Dates and times use **Asia/Taipei** application semantics. API responses expose 
 - Conversation isolation by authenticated user and `conversation_id`, with provider mismatch protection.
 - Asia/Taipei-aware due-date validation, normalization, filtering, and response serialization.
 - Backend-enforced two-step confirmation for chat-based task deletion.
+- Email/password authentication with Argon2id hashes and opaque, server-side sessions.
+- HttpOnly session cookies, Origin validation, double-submit CSRF protection, and owner-scoped data access.
+- Server-side rate limits, durable per-user daily chat request quotas, and provider request guardrails.
 - React + TypeScript + Vite client with a chat panel and task list.
-- Pytest suite and GitHub Actions CI for regression checks.
+- Backend, frontend, and isolated Mock-provider Playwright E2E regression coverage in GitHub Actions.
 
 ## Tech Stack
 
@@ -53,6 +58,8 @@ flowchart LR
 ```
 
 The Vite development server proxies `/api/*` to FastAPI on port `8001`. Its React client uses the HttpOnly session cookie with `credentials: "include"`, requests a separate CSRF token from `/auth/csrf`, and never stores either session credentials or passwords in browser storage. Providers receive a system prompt, the user message, tool definitions, and provider-specific conversation context. They never receive direct database access.
+
+For a component-level view of data ownership, authentication, tool execution, and quotas, see [Architecture Notes](docs/architecture.md).
 
 ## How AI Tool Calling Works
 
@@ -93,18 +100,29 @@ The REST endpoint `DELETE /tasks/{task_id}` performs ordinary direct CRUD deleti
 
 This confirmation is enforced by the backend, not merely by an LLM instruction.
 
+## Authentication and Security
+
+- Passwords are stored as **Argon2id hashes**; raw passwords are never written to the database.
+- Login issues a high-entropy opaque token in an **HttpOnly** cookie. SQLite stores only its SHA-256 digest.
+- `POST`, `PATCH`, and `DELETE` browser mutations require both an explicit allowed Origin and a matching CSRF cookie/header token.
+- `/tasks` and `/chat` require an authenticated session. Task and Conversation queries are always filtered by the server-derived user ID.
+- Tool schemas reject unexpected fields, and the LLM cannot provide or change `user_id`.
+- Login, registration, CSRF issuance, and chat have server-side request limits. Chat also has a SQLite-backed daily request quota.
+
+These controls are intentionally documented with their deployment boundaries in [deployment security notes](docs/deployment-security.md). In particular, the minute limiter and in-flight chat guard are single-process controls.
+
 ## Project Structure
 
 ```text
 ai-task-assistant/
-├── .github/workflows/ci.yml       # Python test workflow
+├── .github/workflows/ci.yml       # Backend, frontend, and browser E2E CI jobs
 ├── frontend/                      # React + TypeScript + Vite client
 │   └── src/api/                   # Typed API client and API models
 ├── src/ai_task_assistant/
 │   ├── api/routes/                # Chat and task HTTP routes
 │   ├── core/                      # Settings and datetime helpers
 │   ├── db/                        # SQLAlchemy engine and base
-│   ├── models/                    # SQLAlchemy Task model
+│   ├── models/                    # User, Session, Task, Conversation, and quota models
 │   ├── schemas/                   # API and tool Pydantic schemas
 │   ├── services/
 │   │   ├── ai_service.py          # Shared prompt and validated tool execution
@@ -237,7 +255,7 @@ The supported topology for this MVP is **one application process with one SQLite
 
 The application uses `Request.client.host` and intentionally ignores arbitrary `X-Forwarded-For`. Behind a reverse proxy, configure Uvicorn proxy-header trust only for a known proxy address or network; never use `--forwarded-allow-ips="*"`. Production requires HTTPS, `SESSION_COOKIE_SECURE=true`, and explicit HTTPS values in `AUTH_ALLOWED_ORIGINS`; do not use wildcard credentialed CORS. See [deployment security notes](docs/deployment-security.md) before deployment.
 
-## Running Tests
+## Testing and CI
 
 Run the complete backend test suite from the repository root:
 
@@ -274,6 +292,8 @@ npm run test:e2e
 The E2E suite covers browser login/register, HttpOnly cookie flow, `/auth/me`, CSRF rejection, authenticated Task CRUD API calls, mock chat, quota feedback, logout, and user task isolation. GitHub Actions installs Chromium with Linux dependencies and runs this suite in a separate Browser E2E job. It does not validate production HTTPS, reverse-proxy forwarding, real provider behavior, or a deployed browser environment.
 
 GitHub Actions runs `python -m pip install -e ".[dev]"` and `python -m pytest` on Ubuntu with Python 3.12 for every push and pull request. Workflow status is available in the repository's **Actions** tab and on pull requests.
+
+The workflow also uses `npm ci`, runs Vitest and the TypeScript/Vite build, then installs Playwright Chromium for the isolated browser E2E job. Test providers are mocked; CI does not require real OpenAI or Gemini credentials.
 
 ## API Endpoints
 
@@ -343,11 +363,11 @@ docker run --rm --name ai-task-assistant -p 8000:8000 \
 
 Verify `http://127.0.0.1:8000/health` after startup. Docker image build and runtime verification are not part of the documentation checks in this repository environment.
 
-## Limitations and Future Improvements
+## Current Limitations
 
 - Task and Conversation ownership are enforced in application code. However, a legacy SQLite database must be migrated before startup; the application now fails closed when it detects the old globally scoped Task or Conversation schema.
 - Conversation state persists in SQLite, but pending deletion authorization remains process-local and disappears after an application restart. It is deliberately not restored from Gemini/OpenAI history.
-- The application is designed for a local demo, not for direct public deployment or a multi-user environment.
+- The application supports authenticated user isolation, but it is **not production-deployed** and should not be exposed publicly without completing the deployment validation documented in `docs/deployment-security.md`.
 - `conversation_id` is scoped by the authenticated user and is not independently sufficient for access.
 - Gemini history is limited by complete turns, not an exact token budget.
 - `Base.metadata.create_all()` creates missing tables only; it is not a schema migration system. Existing databases need a deliberate migration before any future model-column change.
@@ -356,4 +376,16 @@ Verify `http://127.0.0.1:8000/health` after startup. Docker image build and runt
 - API keys must remain server-side. Provider usage may incur cost depending on the selected model and account plan.
 - Durable daily quota tracks request admission only; it is not exact token accounting or a provider billing cap. Configure provider-side budgets and alerts before using paid APIs.
 - The minute and concurrent chat guards are single-process only. A multi-worker or multi-replica deployment needs shared rate limiting and distributed leases.
-- Potential next steps include provider usage observability, end-to-end browser tests, and production deployment design.
+- Browser E2E tests use a localhost-only environment and a mock LLM provider. They do not validate real provider behavior, production HTTPS, or reverse-proxy configuration.
+
+## Future Improvements
+
+- Add provider usage observability and an application-level token/cost reporting design.
+- Design shared rate limiting and distributed in-flight leases before supporting multiple workers or replicas.
+- Complete a reviewed ownership migration and validate backup/restore procedures against the intended deployment database.
+- Add production HTTPS and reverse-proxy integration validation with explicit trusted proxy configuration.
+- Add account recovery, email verification, and session-management UX if the project evolves beyond portfolio scope.
+
+## Portfolio Notes
+
+For resume-ready engineering highlights and interview discussion prompts, see [Portfolio Summary](docs/portfolio-summary.md).
