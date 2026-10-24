@@ -15,6 +15,7 @@ from ai_task_assistant.db.base import Base
 from ai_task_assistant.core.datetime import TAIPEI_TIMEZONE
 from ai_task_assistant.models.conversation import Conversation
 from ai_task_assistant.models.task import Task
+from ai_task_assistant.models.user import User
 from ai_task_assistant.services.conversation_codec import (
     ConversationCodecError,
     GEMINI_HISTORY_SCHEMA_VERSION,
@@ -22,6 +23,9 @@ from ai_task_assistant.services.conversation_codec import (
     encode_gemini_history,
 )
 from ai_task_assistant.services import conversation_service
+
+
+USER_ID = 1
 
 
 def make_text_history() -> list[types.Content]:
@@ -59,6 +63,8 @@ def session() -> Session:
     Base.metadata.create_all(engine)
     try:
         with Session(engine) as db:
+            db.add(User(id=USER_ID, email="conversation@example.com", password_hash="test-hash"))
+            db.commit()
             yield db
     finally:
         Base.metadata.drop_all(engine)
@@ -75,6 +81,7 @@ def test_conversations_table_is_created_without_removing_tasks_table() -> None:
 
 def test_conversation_fields_and_openai_response_id_round_trip(session: Session) -> None:
     conversation = Conversation(
+        user_id=USER_ID,
         conversation_id="openai-demo",
         provider="openai",
         openai_response_id="resp_final_123",
@@ -109,6 +116,7 @@ def test_gemini_text_history_round_trips_through_json() -> None:
 def test_gemini_tool_history_round_trips_through_json(session: Session) -> None:
     encoded = encode_gemini_history(make_tool_history())
     conversation = Conversation(
+        user_id=USER_ID,
         conversation_id="gemini-demo",
         provider="gemini",
         gemini_history_json=encoded,
@@ -152,7 +160,7 @@ def test_unpaired_gemini_function_call_fails() -> None:
 
 
 def test_conversation_timestamps_restore_asia_taipei_awareness(session: Session) -> None:
-    conversation = Conversation(conversation_id="time-demo", provider="openai")
+    conversation = Conversation(user_id=USER_ID, conversation_id="time-demo", provider="openai")
     session.add(conversation)
     session.commit()
     session.expire_all()
@@ -167,7 +175,7 @@ def test_conversation_timestamps_restore_asia_taipei_awareness(session: Session)
 
 
 def test_state_version_defaults_to_one(session: Session) -> None:
-    conversation = Conversation(conversation_id="version-demo", provider="openai")
+    conversation = Conversation(user_id=USER_ID, conversation_id="version-demo", provider="openai")
     session.add(conversation)
     session.commit()
 
@@ -191,6 +199,7 @@ def test_conversation_database_constraints_are_enforced(
 ) -> None:
     session.add(
         Conversation(
+            user_id=USER_ID,
             conversation_id=conversation_id,
             provider=provider,
             turn_count=turn_count,
@@ -204,8 +213,8 @@ def test_conversation_database_constraints_are_enforced(
 
 
 def test_existing_task_table_remains_usable_with_conversations(session: Session) -> None:
-    task = Task(title="Existing task")
-    conversation = Conversation(conversation_id="task-compatible", provider="openai")
+    task = Task(user_id=USER_ID, title="Existing task")
+    conversation = Conversation(user_id=USER_ID, conversation_id="task-compatible", provider="openai")
     session.add_all([task, conversation])
     session.commit()
 
@@ -217,6 +226,7 @@ def add_openai_conversation(
     session: Session, conversation_id: str, updated_at: datetime, turn_count: int = 1
 ) -> Conversation:
     conversation = Conversation(
+        user_id=USER_ID,
         conversation_id=conversation_id,
         provider="openai",
         openai_response_id=f"resp-{conversation_id}",
@@ -233,10 +243,10 @@ def test_cleanup_keeps_conversations_updated_within_retention(session: Session) 
     now = datetime(2026, 10, 21, 12, 0, tzinfo=TAIPEI_TIMEZONE)
     add_openai_conversation(session, "recent", now - timedelta(days=29))
 
-    deleted = conversation_service.cleanup_expired_conversations(session, now)
+    deleted = conversation_service.cleanup_expired_conversations(session, user_id=USER_ID, now=now)
 
     assert deleted == 0
-    assert conversation_service.get_conversation(session, "recent") is not None
+    assert conversation_service.get_conversation(session, user_id=USER_ID, conversation_id="recent") is not None
 
 
 def test_cleanup_deletes_only_conversations_strictly_older_than_cutoff(session: Session) -> None:
@@ -244,21 +254,21 @@ def test_cleanup_deletes_only_conversations_strictly_older_than_cutoff(session: 
     add_openai_conversation(session, "at-cutoff", now - timedelta(days=30))
     add_openai_conversation(session, "expired", now - timedelta(days=30, seconds=1))
 
-    deleted = conversation_service.cleanup_expired_conversations(session, now)
+    deleted = conversation_service.cleanup_expired_conversations(session, user_id=USER_ID, now=now)
 
     assert deleted == 1
-    assert conversation_service.get_conversation(session, "at-cutoff") is not None
-    assert conversation_service.get_conversation(session, "expired") is None
+    assert conversation_service.get_conversation(session, user_id=USER_ID, conversation_id="at-cutoff") is not None
+    assert conversation_service.get_conversation(session, user_id=USER_ID, conversation_id="expired") is None
 
 
 def test_cleanup_does_not_delete_tasks(session: Session) -> None:
     now = datetime(2026, 10, 21, 12, 0, tzinfo=TAIPEI_TIMEZONE)
-    task = Task(title="Must remain")
+    task = Task(user_id=USER_ID, title="Must remain")
     session.add(task)
     session.commit()
     add_openai_conversation(session, "expired-with-task", now - timedelta(days=31))
 
-    conversation_service.cleanup_expired_conversations(session, now)
+    conversation_service.cleanup_expired_conversations(session, user_id=USER_ID, now=now)
 
     assert session.get(Task, task.id) is not None
 
@@ -270,13 +280,15 @@ def test_expired_conversation_id_can_start_a_new_conversation(
     add_openai_conversation(session, "reused-id", now - timedelta(days=31))
     monkeypatch.setattr(conversation_service, "current_taipei_time", lambda: now)
 
-    state = conversation_service.prepare_conversation(session, "reused-id", "openai")
+    state = conversation_service.prepare_conversation(session, user_id=USER_ID, conversation_id="reused-id", provider="openai")
     new_state = conversation_service.save_response(
         session,
-        "reused-id",
-        "resp-new",
-        "openai",
+        user_id=USER_ID,
+        conversation_id="reused-id",
+        provider_state="resp-new",
+        provider="openai",
         expected_state_version=None,
+        expected_row_id=None,
     )
 
     assert state is None
@@ -296,7 +308,7 @@ def test_cleanup_runs_before_new_conversation_limit_check(
         )
     monkeypatch.setattr(conversation_service, "current_taipei_time", lambda: now)
 
-    state = conversation_service.prepare_conversation(session, "new-after-cleanup", "openai")
+    state = conversation_service.prepare_conversation(session, user_id=USER_ID, conversation_id="new-after-cleanup", provider="openai")
 
     assert state is None
     assert session.query(Conversation).count() == 0
@@ -319,7 +331,7 @@ def test_cleanup_failure_rolls_back(session: Session, monkeypatch: pytest.Monkey
     monkeypatch.setattr(session, "rollback", record_rollback)
 
     with pytest.raises(conversation_service.ConversationStorageError):
-        conversation_service.cleanup_expired_conversations(session)
+        conversation_service.cleanup_expired_conversations(session, user_id=USER_ID)
 
     assert rollback_called is True
 
@@ -330,30 +342,41 @@ def test_cleanup_cannot_revive_an_inflight_expired_conversation(conversation_eng
         add_openai_conversation(setup_session, "inflight-expired", now - timedelta(days=31))
 
     with Session(conversation_engine) as request_a_session:
-        stale_state = conversation_service.get_conversation(request_a_session, "inflight-expired")
+        stale_state = conversation_service.get_conversation(
+            request_a_session, user_id=USER_ID, conversation_id="inflight-expired"
+        )
 
     with Session(conversation_engine) as request_b_session:
-        assert conversation_service.cleanup_expired_conversations(request_b_session, now) == 1
+        assert conversation_service.cleanup_expired_conversations(
+            request_b_session, user_id=USER_ID, now=now
+        ) == 1
 
     assert stale_state is not None
     with Session(conversation_engine) as request_a_save_session:
         with pytest.raises(conversation_service.ConversationConflictError):
             conversation_service.save_response(
                 request_a_save_session,
-                "inflight-expired",
-                "resp-after-cleanup",
-                "openai",
+                user_id=USER_ID,
+                conversation_id="inflight-expired",
+                provider_state="resp-after-cleanup",
+                provider="openai",
                 expected_state_version=stale_state.state_version,
+                expected_row_id=stale_state.row_id,
             )
 
     with Session(conversation_engine) as verification_session:
-        assert conversation_service.get_conversation(verification_session, "inflight-expired") is None
+        assert conversation_service.get_conversation(
+            verification_session, user_id=USER_ID, conversation_id="inflight-expired"
+        ) is None
 
 
 @pytest.fixture
 def conversation_engine():
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add(User(id=USER_ID, email="engine@example.com", password_hash="test-hash"))
+        db.commit()
     try:
         yield engine
     finally:
@@ -364,15 +387,17 @@ def test_openai_conversation_state_round_trips_across_sessions(conversation_engi
     with Session(conversation_engine) as first_session:
         conversation_service.save_response(
             first_session,
-            "openai-cross-session",
-            "resp_first",
-            "openai",
+            user_id=USER_ID,
+            conversation_id="openai-cross-session",
+            provider_state="resp_first",
+            provider="openai",
             expected_state_version=None,
+            expected_row_id=None,
         )
 
     with Session(conversation_engine) as second_session:
         restored = conversation_service.prepare_conversation(
-            second_session, "openai-cross-session", "openai"
+            second_session, user_id=USER_ID, conversation_id="openai-cross-session", provider="openai"
         )
 
     assert restored is not None
@@ -387,15 +412,17 @@ def test_gemini_history_round_trips_across_sessions(conversation_engine) -> None
     with Session(conversation_engine) as first_session:
         conversation_service.save_response(
             first_session,
-            "gemini-cross-session",
-            history,
-            "gemini",
+            user_id=USER_ID,
+            conversation_id="gemini-cross-session",
+            provider_state=history,
+            provider="gemini",
             expected_state_version=None,
+            expected_row_id=None,
         )
 
     with Session(conversation_engine) as second_session:
         restored = conversation_service.prepare_conversation(
-            second_session, "gemini-cross-session", "gemini"
+            second_session, user_id=USER_ID, conversation_id="gemini-cross-session", provider="gemini"
         )
 
     assert restored is not None
@@ -410,24 +437,32 @@ def test_stale_conversation_update_raises_conflict(conversation_engine) -> None:
     with Session(conversation_engine) as first_session:
         conversation_service.save_response(
             first_session,
-            "stale-update",
-            "resp_first",
-            "openai",
+            user_id=USER_ID,
+            conversation_id="stale-update",
+            provider_state="resp_first",
+            provider="openai",
             expected_state_version=None,
+            expected_row_id=None,
         )
 
     with Session(conversation_engine) as stale_session:
-        stale_state = conversation_service.get_conversation(stale_session, "stale-update")
+        stale_state = conversation_service.get_conversation(
+            stale_session, user_id=USER_ID, conversation_id="stale-update"
+        )
 
     with Session(conversation_engine) as current_session:
-        current_state = conversation_service.get_conversation(current_session, "stale-update")
+        current_state = conversation_service.get_conversation(
+            current_session, user_id=USER_ID, conversation_id="stale-update"
+        )
         assert current_state is not None
         conversation_service.save_response(
             current_session,
-            "stale-update",
-            "resp_current",
-            "openai",
+            user_id=USER_ID,
+            conversation_id="stale-update",
+            provider_state="resp_current",
+            provider="openai",
             expected_state_version=current_state.state_version,
+            expected_row_id=current_state.row_id,
         )
 
     assert stale_state is not None
@@ -435,10 +470,12 @@ def test_stale_conversation_update_raises_conflict(conversation_engine) -> None:
         with pytest.raises(conversation_service.ConversationConflictError):
             conversation_service.save_response(
                 stale_save_session,
-                "stale-update",
-                "resp_stale",
-                "openai",
+                user_id=USER_ID,
+                conversation_id="stale-update",
+                provider_state="resp_stale",
+                provider="openai",
                 expected_state_version=stale_state.state_version,
+                expected_row_id=stale_state.row_id,
             )
 
 
@@ -446,20 +483,24 @@ def test_concurrent_create_unique_conflict_raises_conflict(conversation_engine) 
     with Session(conversation_engine) as first_session:
         conversation_service.save_response(
             first_session,
-            "duplicate-create",
-            "resp_first",
-            "openai",
+            user_id=USER_ID,
+            conversation_id="duplicate-create",
+            provider_state="resp_first",
+            provider="openai",
             expected_state_version=None,
+            expected_row_id=None,
         )
 
     with Session(conversation_engine) as second_session:
         with pytest.raises(conversation_service.ConversationConflictError):
             conversation_service.save_response(
                 second_session,
-                "duplicate-create",
-                "resp_duplicate",
-                "openai",
+                user_id=USER_ID,
+                conversation_id="duplicate-create",
+                provider_state="resp_duplicate",
+                provider="openai",
                 expected_state_version=None,
+                expected_row_id=None,
             )
 
 
@@ -468,23 +509,28 @@ def test_pending_deletion_remains_process_local_after_state_persists(conversatio
     with Session(conversation_engine) as session:
         conversation_service.save_response(
             session,
-            "pending-is-not-persisted",
-            "resp_first",
-            "openai",
+            user_id=USER_ID,
+            conversation_id="pending-is-not-persisted",
+            provider_state="resp_first",
+            provider="openai",
             expected_state_version=None,
+            expected_row_id=None,
         )
     conversation_service.save_pending_deletion(
-        "pending-is-not-persisted",
-        conversation_service.PendingDeletionRequest(task_id=1, title="Delete me"),
+        user_id=USER_ID,
+        conversation_id="pending-is-not-persisted",
+        request=conversation_service.PendingDeletionRequest(task_id=1, title="Delete me"),
     )
 
     conversation_service.clear_pending_deletions()
 
     with Session(conversation_engine) as restarted_session:
         assert conversation_service.get_conversation(
-            restarted_session, "pending-is-not-persisted"
+            restarted_session, user_id=USER_ID, conversation_id="pending-is-not-persisted"
         ) is not None
-    assert conversation_service.get_pending_deletion("pending-is-not-persisted") is None
+    assert conversation_service.get_pending_deletion(
+        user_id=USER_ID, conversation_id="pending-is-not-persisted"
+    ) is None
 
 
 def _run_persistence_subprocess(database_path: Path, script: str) -> None:
@@ -523,6 +569,7 @@ from google.genai import types
 
 from ai_task_assistant.db.base import Base
 from ai_task_assistant.db.session import SessionLocal, engine
+from ai_task_assistant.models.user import User
 from ai_task_assistant.services.conversation_service import (
     PendingDeletionRequest,
     save_pending_deletion,
@@ -535,10 +582,19 @@ history = [
     types.Content(role="model", parts=[types.Part.from_text(text="hi")]),
 ]
 with SessionLocal() as db:
-    save_response(db, "restart-openai", "resp_final_restart", "openai", None)
-    save_response(db, "restart-gemini", history, "gemini", None)
+    db.add(User(id=1, email="restart@example.com", password_hash="test-hash"))
+    db.commit()
+    save_response(
+        db, user_id=1, conversation_id="restart-openai", provider_state="resp_final_restart",
+        provider="openai", expected_state_version=None, expected_row_id=None,
+    )
+    save_response(
+        db, user_id=1, conversation_id="restart-gemini", provider_state=history,
+        provider="gemini", expected_state_version=None, expected_row_id=None,
+    )
 save_pending_deletion(
-    "restart-openai", PendingDeletionRequest(task_id=1, title="Not persisted")
+    user_id=1, conversation_id="restart-openai",
+    request=PendingDeletionRequest(task_id=1, title="Not persisted")
 )
 """,
     )
@@ -553,8 +609,8 @@ from ai_task_assistant.services.conversation_service import (
 )
 
 with SessionLocal() as db:
-    openai_state = get_conversation(db, "restart-openai")
-    gemini_state = get_conversation(db, "restart-gemini")
+    openai_state = get_conversation(db, user_id=1, conversation_id="restart-openai")
+    gemini_state = get_conversation(db, user_id=1, conversation_id="restart-gemini")
 
 assert openai_state is not None
 assert openai_state.provider_state == "resp_final_restart"
@@ -563,6 +619,6 @@ assert gemini_state is not None
 assert gemini_state.provider == "gemini"
 assert gemini_state.provider_state[0].role == "user"
 assert gemini_state.provider_state[1].role == "model"
-assert get_pending_deletion("restart-openai") is None
+assert get_pending_deletion(user_id=1, conversation_id="restart-openai") is None
 """,
     )

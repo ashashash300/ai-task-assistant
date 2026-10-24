@@ -2,13 +2,15 @@ import re
 
 from pydantic import BaseModel, Field, field_validator
 
+from ai_task_assistant.core.config import settings
+
 
 CONVERSATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
 class ChatRequest(BaseModel):
     conversation_id: str | None = Field(default=None, max_length=64)
-    message: str = Field(min_length=1, max_length=4_000)
+    message: str = Field(min_length=1)
 
     @field_validator("conversation_id")
     @classmethod
@@ -27,6 +29,8 @@ class ChatRequest(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("message must not be empty")
+        if len(value) > settings.chat_input_max_length:
+            raise ValueError("message exceeds the configured maximum length")
         return value
 
 

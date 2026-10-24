@@ -8,11 +8,13 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from ai_task_assistant.api.dependencies.auth import require_csrf_protection, require_current_user
 from ai_task_assistant.db.base import Base
 from ai_task_assistant.db.session import get_db
 import ai_task_assistant.main as main_module
 from ai_task_assistant.main import app
 from ai_task_assistant.models.task import Task
+from ai_task_assistant.models.user import User
 
 
 @pytest.fixture
@@ -24,6 +26,11 @@ def client() -> Generator[TestClient, None, None]:
     )
     test_session = sessionmaker(bind=test_engine, autoflush=False, autocommit=False)
     Base.metadata.create_all(bind=test_engine)
+    with test_session() as db:
+        user = User(email="tasks@example.com", password_hash="test-hash")
+        db.add(user)
+        db.commit()
+        db.refresh(user)
 
     def override_get_db() -> Generator[Session, None, None]:
         db = test_session()
@@ -33,6 +40,8 @@ def client() -> Generator[TestClient, None, None]:
             db.close()
 
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[require_current_user] = lambda: user
+    app.dependency_overrides[require_csrf_protection] = lambda: None
     original_engine = main_module.engine
     main_module.engine = test_engine
     try:
@@ -96,7 +105,10 @@ def test_sqlite_storage_restores_asia_taipei_timezone() -> None:
     due_date = datetime(2026, 10, 1, 15, tzinfo=ZoneInfo("Asia/Taipei"))
 
     with Session(engine) as session:
-        task = Task(title="Stored timezone task", due_date=due_date)
+        user = User(email="timezone@example.com", password_hash="test-hash")
+        session.add(user)
+        session.flush()
+        task = Task(user_id=user.id, title="Stored timezone task", due_date=due_date)
         session.add(task)
         session.commit()
         stored_value = session.execute(text("SELECT due_date FROM tasks")).scalar_one()

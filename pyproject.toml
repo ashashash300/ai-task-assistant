@@ -9,6 +9,7 @@ description = "An AI-powered task management API."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "argon2-cffi>=23.1,<26.0",
     "fastapi>=0.115,<1.0",
     "google-genai>=2.3,<3.0",
     "openai>=1.0,<3.0",

@@ -1,7 +1,9 @@
 import json
 import logging
 from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time, timedelta
+from threading import Barrier
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -20,14 +22,17 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from ai_task_assistant.api.dependencies.auth import require_csrf_protection, require_current_user
 from ai_task_assistant.db.base import Base
 from ai_task_assistant.db.session import get_db
 import ai_task_assistant.api.routes.chat as chat_route
 import ai_task_assistant.main as main_module
 from ai_task_assistant.main import app
 from ai_task_assistant.services import ai_service
+from ai_task_assistant.services.ai_service import ChatResult
 from ai_task_assistant.core.config import settings
 from ai_task_assistant.core.datetime import current_taipei_time
+from ai_task_assistant.models.user import User
 from ai_task_assistant.services import conversation_service
 from ai_task_assistant.services import openai_provider
 
@@ -59,6 +64,11 @@ def client() -> Generator[TestClient, None, None]:
     )
     test_session = sessionmaker(bind=test_engine, autoflush=False, autocommit=False)
     Base.metadata.create_all(bind=test_engine)
+    with test_session() as db:
+        user = User(email="chat@example.com", password_hash="test-hash")
+        db.add(user)
+        db.commit()
+        db.refresh(user)
 
     def override_get_db() -> Generator[Session, None, None]:
         db = test_session()
@@ -69,6 +79,8 @@ def client() -> Generator[TestClient, None, None]:
 
     conversation_service.clear_pending_deletions()
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[require_current_user] = lambda: user
+    app.dependency_overrides[require_csrf_protection] = lambda: None
     original_engine = main_module.engine
     main_module.engine = test_engine
     try:
@@ -125,7 +137,7 @@ def mock_llm(monkeypatch: pytest.MonkeyPatch, responses: list[object]) -> MockOp
 
 def get_persisted_conversation(client: TestClient, conversation_id: str):
     with client.conversation_session_factory() as db:
-        return conversation_service.get_conversation(db, conversation_id)
+        return conversation_service.get_conversation(db, user_id=1, conversation_id=conversation_id)
 
 
 def save_persisted_openai_conversation(
@@ -134,10 +146,12 @@ def save_persisted_openai_conversation(
     with client.conversation_session_factory() as db:
         conversation_service.save_response(
             db,
-            conversation_id,
-            response_id,
-            "openai",
+            user_id=1,
+            conversation_id=conversation_id,
+            provider_state=response_id,
+            provider="openai",
             expected_state_version=None,
+            expected_row_id=None,
         )
 
 
@@ -441,7 +455,7 @@ def test_openai_delete_tool_requires_confirmation_before_deleting(
     assert requested.status_code == 200
     assert requested.json()["response"] == "請確認是否刪除「Delete me」？"
     assert client.get(f"/tasks/{task['id']}").status_code == 200
-    pending = conversation_service.get_pending_deletion("delete-openai")
+    pending = conversation_service.get_pending_deletion(user_id=1, conversation_id="delete-openai")
     assert pending is not None
     assert pending.task_id == task["id"]
 
@@ -452,7 +466,51 @@ def test_openai_delete_tool_requires_confirmation_before_deleting(
     assert confirmed.status_code == 200
     assert confirmed.json()["response"] == "已刪除「Delete me」。"
     assert client.get(f"/tasks/{task['id']}").status_code == 404
-    assert conversation_service.get_pending_deletion("delete-openai") is None
+    assert conversation_service.get_pending_deletion(user_id=1, conversation_id="delete-openai") is None
+
+
+def test_concurrent_delete_confirmations_consume_pending_state_once(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only one same-user confirmation may consume a process-local authorization."""
+
+    task = client.post("/tasks", json={"title": "Delete concurrently"}).json()
+    conversation_service.save_pending_deletion(
+        user_id=1,
+        conversation_id="concurrent-delete",
+        request=conversation_service.PendingDeletionRequest(task_id=task["id"], title=task["title"]),
+    )
+    monkeypatch.setattr(chat_route, "prepare_conversation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        chat_route,
+        "run_chat",
+        lambda *_args, **_kwargs: ChatResult(
+            response="沒有待確認的刪除要求。", conversation_state="unused"
+        ),
+    )
+    monkeypatch.setattr(chat_route, "save_response", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(chat_route, "reserve_daily_chat_quota", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(settings, "chat_concurrent_limit", 2)
+    monkeypatch.setattr(settings, "chat_daily_quota", 10)
+    barrier = Barrier(2)
+
+    def confirm() -> str:
+        with client.conversation_session_factory() as db:
+            barrier.wait(timeout=3)
+            response = chat_route.chat(
+                chat_route.ChatRequest(conversation_id="concurrent-delete", message="確認"),
+                current_user=User(id=1, email="chat@example.com", password_hash="test-hash"),
+                _csrf=None,
+                db=db,
+            )
+            return response.response
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = [future.result(timeout=5) for future in [executor.submit(confirm), executor.submit(confirm)]]
+
+    assert sorted(responses) == ["已刪除「Delete concurrently」。", "沒有待確認的刪除要求。"]
+    assert client.get(f"/tasks/{task['id']}").status_code == 404
+    assert conversation_service.get_pending_deletion(user_id=1, conversation_id="concurrent-delete") is None
 
 
 def test_delete_confirmation_can_be_cancelled(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -469,7 +527,7 @@ def test_delete_confirmation_can_be_cancelled(client: TestClient, monkeypatch: p
 
     assert cancelled.json()["response"] == "已取消刪除「Keep me」。"
     assert client.get(f"/tasks/{task['id']}").status_code == 200
-    assert conversation_service.get_pending_deletion("delete-cancel") is None
+    assert conversation_service.get_pending_deletion(user_id=1, conversation_id="delete-cancel") is None
 
 
 def test_confirmation_without_pending_deletion_cannot_delete_task(
@@ -510,7 +568,7 @@ def test_pending_deletion_expires_after_application_restart(
 
     assert response.status_code == 200
     assert client.get(f"/tasks/{task['id']}").status_code == 200
-    assert conversation_service.get_pending_deletion("restart-delete") is None
+    assert conversation_service.get_pending_deletion(user_id=1, conversation_id="restart-delete") is None
 
 
 def test_pending_deletions_are_isolated_by_conversation_id(
@@ -583,7 +641,7 @@ def test_expired_delete_confirmation_cannot_delete_task(
         ],
     )
     client.post("/chat", json={"conversation_id": "expired-delete", "message": "刪除任務"})
-    pending = conversation_service.get_pending_deletion("expired-delete")
+    pending = conversation_service.get_pending_deletion(user_id=1, conversation_id="expired-delete")
     assert pending is not None
     pending.expires_at = current_taipei_time() - timedelta(seconds=1)
 
@@ -593,7 +651,7 @@ def test_expired_delete_confirmation_cannot_delete_task(
 
     assert response.status_code == 200
     assert client.get(f"/tasks/{task['id']}").status_code == 200
-    assert conversation_service.get_pending_deletion("expired-delete") is None
+    assert conversation_service.get_pending_deletion(user_id=1, conversation_id="expired-delete") is None
 
 
 def test_delete_tool_handles_nonexistent_task_and_cannot_be_reused(
@@ -625,7 +683,7 @@ def test_delete_tool_handles_nonexistent_task_and_cannot_be_reused(
     )
 
     assert missing.status_code == 200
-    assert conversation_service.get_pending_deletion("missing-delete") is None
+    assert conversation_service.get_pending_deletion(user_id=1, conversation_id="missing-delete") is None
     assert requested.json()["response"] == "請確認是否刪除「Delete once」？"
     assert first_confirmation.status_code == 200
     assert second_confirmation.status_code == 200
@@ -909,6 +967,7 @@ def test_invalid_conversation_id_is_rejected(client: TestClient, conversation_id
 def test_conversation_turn_limit_rejects_next_request_without_calling_llm(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(settings, "chat_user_limit", conversation_service.MAX_TURNS_PER_CONVERSATION + 1)
     responses = [final_response("完成", f"resp_{index}") for index in range(10)]
     mock_client = mock_llm(monkeypatch, responses)
 

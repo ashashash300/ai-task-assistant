@@ -9,12 +9,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from ai_task_assistant.api.dependencies.auth import require_csrf_protection, require_current_user
 from ai_task_assistant.core.config import settings
 from ai_task_assistant.db.base import Base
 from ai_task_assistant.db.session import get_db
 import ai_task_assistant.main as main_module
 from ai_task_assistant.main import app
 from ai_task_assistant.models.conversation import Conversation
+from ai_task_assistant.models.user import User
 from ai_task_assistant.services import ai_service, conversation_service, gemini_provider
 
 
@@ -47,6 +49,11 @@ def client() -> Generator[TestClient, None, None]:
     )
     test_session = sessionmaker(bind=test_engine, autoflush=False, autocommit=False)
     Base.metadata.create_all(bind=test_engine)
+    with test_session() as db:
+        user = User(email="gemini@example.com", password_hash="test-hash")
+        db.add(user)
+        db.commit()
+        db.refresh(user)
 
     def override_get_db() -> Generator[Session, None, None]:
         db = test_session()
@@ -57,6 +64,8 @@ def client() -> Generator[TestClient, None, None]:
 
     conversation_service.clear_pending_deletions()
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[require_current_user] = lambda: user
+    app.dependency_overrides[require_csrf_protection] = lambda: None
     original_engine = main_module.engine
     main_module.engine = test_engine
     try:
@@ -103,7 +112,7 @@ def mock_gemini(monkeypatch: pytest.MonkeyPatch, responses: list[object]) -> Moc
 
 def get_persisted_conversation(client: TestClient, conversation_id: str):
     with client.conversation_session_factory() as db:
-        return conversation_service.get_conversation(db, conversation_id)
+        return conversation_service.get_conversation(db, user_id=1, conversation_id=conversation_id)
 
 
 def test_gemini_plain_text_response_uses_manual_tool_execution_config(
@@ -232,10 +241,12 @@ def test_persisted_gemini_delete_history_cannot_authorize_after_restart(
     with client.conversation_session_factory() as db:
         conversation_service.save_response(
             db,
-            "persisted-gemini-delete",
-            history,
-            "gemini",
+            user_id=1,
+            conversation_id="persisted-gemini-delete",
+            provider_state=history,
+            provider="gemini",
             expected_state_version=None,
+            expected_row_id=None,
         )
     # The fixture starts with an empty pending-deletion store, equivalent to a restart.
     mock_gemini(monkeypatch, [gemini_text("請重新提出刪除要求。")])
@@ -455,8 +466,9 @@ def test_invalid_persisted_gemini_history_returns_conflict(
 ) -> None:
     with client.conversation_session_factory() as db:
         db.add(
-            Conversation(
-                conversation_id="corrupt-gemini-history",
+                Conversation(
+                    user_id=1,
+                    conversation_id="corrupt-gemini-history",
                 provider="gemini",
                 gemini_history_json=history_payload,
                 turn_count=1,

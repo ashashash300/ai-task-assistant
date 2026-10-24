@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import DateTime, Enum as SqlEnum, Integer, String, Text
+from sqlalchemy import DateTime, Enum as SqlEnum, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
@@ -42,8 +42,13 @@ class Task(Base):
     """A todo task stored in the local SQLite database."""
 
     __tablename__ = "tasks"
+    __table_args__ = (
+        Index("ix_tasks_user_id_id", "user_id", "id"),
+        Index("ix_tasks_user_id_due_date", "user_id", "due_date"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     due_date: Mapped[datetime | None] = mapped_column(TaipeiDateTime(), nullable=True)
