@@ -161,15 +161,36 @@ async function csrfFetch<T>(
   }, { path, init });
 }
 
-function waitForPathResponse(page: Page, pathname: string, method: string) {
-  return page.waitForResponse((response) => {
-    const responsePathname = new URL(response.url()).pathname;
-    return responsePathname === pathname && response.request().method() === method;
+function isExpectedPathResponse(response: Response, pathname: string, method: string): boolean {
+  return new URL(response.url()).pathname === pathname && response.request().method() === method;
+}
+
+async function isCsrfValidationFailure(response: Response): Promise<boolean> {
+  if (response.status() !== 403) return false;
+  const body: unknown = await response.json().catch(() => undefined);
+  return typeof body === "object" && body !== null && "detail" in body &&
+    typeof (body as { detail?: unknown }).detail === "object" &&
+    (body as { detail: { code?: unknown } }).detail.code === "csrf_validation_failed";
+}
+
+function waitForFinalMutationResponse(
+  page: Page,
+  pathname: string,
+  method: string,
+  expectedStatus: number,
+): Promise<Response> {
+  return page.waitForResponse(async (response) => {
+    if (!isExpectedPathResponse(response, pathname, method)) return false;
+    if (response.status() === expectedStatus) return true;
+    // Only this dependency-level failure is followed by the client's one-time
+    // token refresh and retry. Any other response resolves immediately so the
+    // existing status assertion fails rather than being hidden by a timeout.
+    return !(await isCsrfValidationFailure(response));
   });
 }
 
 async function logoutAndVerify(page: Page, context: import("@playwright/test").BrowserContext): Promise<void> {
-  const logoutResponse = waitForPathResponse(page, "/api/auth/logout", "POST");
+  const logoutResponse = waitForFinalMutationResponse(page, "/api/auth/logout", "POST", 204);
   await page.getByRole("button", { name: "登出", exact: true }).click();
   expect((await logoutResponse).status()).toBe(204);
   await expect.poll(() => page.evaluate(() => fetch("/api/auth/me").then((response) => response.status))).toBe(401);
@@ -224,7 +245,7 @@ test("browser uses HttpOnly session cookies, CSRF, isolated tasks, mock chat, an
     });
 
     await diagnostics.runPhase("mock_chat", async () => {
-      const chatResponse = waitForPathResponse(page, "/api/chat", "POST");
+      const chatResponse = waitForFinalMutationResponse(page, "/api/chat", "POST", 200);
       await page.getByLabel("請告訴 AI 你要處理的任務").fill("測試聊天");
       await page.getByRole("button", { name: "傳送訊息" }).click();
       expect((await chatResponse).status()).toBe(200);
@@ -232,7 +253,7 @@ test("browser uses HttpOnly session cookies, CSRF, isolated tasks, mock chat, an
       await expect(page.getByRole("button", { name: "傳送訊息", exact: true })).toBeEnabled();
     });
     await diagnostics.runPhase("quota", async () => {
-      const quotaResponse = waitForPathResponse(page, "/api/chat", "POST");
+      const quotaResponse = waitForFinalMutationResponse(page, "/api/chat", "POST", 429);
       await page.getByRole("button", { name: "傳送訊息" }).click();
       expect((await quotaResponse).status()).toBe(429);
       await expect(page.getByText("Chat quota exceeded")).toBeVisible();
