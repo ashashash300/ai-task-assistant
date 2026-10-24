@@ -26,7 +26,9 @@ function isCsrfPath(pathname: string): boolean {
 function isAuthPath(pathname: string): boolean {
   return isRegistrationPath(pathname) || isCsrfPath(pathname) ||
     pathname === "/api/auth/me" || pathname === "/auth/me" ||
-    pathname === "/api/auth/login" || pathname === "/auth/login";
+    pathname === "/api/auth/login" || pathname === "/auth/login" ||
+    pathname === "/api/auth/logout" || pathname === "/auth/logout" ||
+    pathname === "/api/chat" || pathname === "/chat";
 }
 
 function createDiagnostics(page: Page, testId: string): E2EDiagnostics {
@@ -159,6 +161,22 @@ async function csrfFetch<T>(
   }, { path, init });
 }
 
+function waitForPathResponse(page: Page, pathname: string, method: string) {
+  return page.waitForResponse((response) => {
+    const responsePathname = new URL(response.url()).pathname;
+    return responsePathname === pathname && response.request().method() === method;
+  });
+}
+
+async function logoutAndVerify(page: Page, context: import("@playwright/test").BrowserContext): Promise<void> {
+  const logoutResponse = waitForPathResponse(page, "/api/auth/logout", "POST");
+  await page.getByRole("button", { name: "登出", exact: true }).click();
+  expect((await logoutResponse).status()).toBe(204);
+  await expect.poll(() => page.evaluate(() => fetch("/api/auth/me").then((response) => response.status))).toBe(401);
+  const cookies = await context.cookies();
+  expect(cookies.some((cookie) => cookie.name === "ai_task_session")).toBeFalsy();
+}
+
 test("browser uses HttpOnly session cookies, CSRF, isolated tasks, mock chat, and logout", async ({ page, context }) => {
   const diagnostics = createDiagnostics(page, "workspace_flow");
   try {
@@ -206,17 +224,22 @@ test("browser uses HttpOnly session cookies, CSRF, isolated tasks, mock chat, an
     });
 
     await diagnostics.runPhase("mock_chat", async () => {
+      const chatResponse = waitForPathResponse(page, "/api/chat", "POST");
       await page.getByLabel("請告訴 AI 你要處理的任務").fill("測試聊天");
       await page.getByRole("button", { name: "傳送訊息" }).click();
+      expect((await chatResponse).status()).toBe(200);
       await expect(page.getByText("Mock AI response")).toBeVisible();
+      await expect(page.getByRole("button", { name: "傳送訊息", exact: true })).toBeEnabled();
     });
     await diagnostics.runPhase("quota", async () => {
+      const quotaResponse = waitForPathResponse(page, "/api/chat", "POST");
       await page.getByRole("button", { name: "傳送訊息" }).click();
+      expect((await quotaResponse).status()).toBe(429);
       await expect(page.getByText("Chat quota exceeded")).toBeVisible();
     });
 
     await diagnostics.runPhase("logout", async () => {
-      await page.getByRole("button", { name: "登出" }).click();
+      await logoutAndVerify(page, context);
       await expect(page.getByRole("heading", { name: "登入工作區" })).toBeVisible();
       await expect.poll(() => page.evaluate(() => fetch("/api/tasks").then((response) => response.status))).toBe(401);
     });
@@ -225,7 +248,7 @@ test("browser uses HttpOnly session cookies, CSRF, isolated tasks, mock chat, an
   }
 });
 
-test("different browser accounts do not share tasks", async ({ page }) => {
+test("different browser accounts do not share tasks", async ({ page, context }) => {
   const diagnostics = createDiagnostics(page, "account_isolation");
   try {
     await registerAndLogin(page, diagnostics, "browser-owner-a@example.com");
@@ -238,7 +261,7 @@ test("different browser accounts do not share tasks", async ({ page }) => {
       expect(created.status).toBe(201);
     });
     await diagnostics.runPhase("logout", async () => {
-      await page.getByRole("button", { name: "登出" }).click();
+      await logoutAndVerify(page, context);
     });
     await registerAndLogin(page, diagnostics, "browser-owner-b@example.com");
     await diagnostics.runPhase("account_isolation", async () => {
